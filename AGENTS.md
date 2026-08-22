@@ -10,6 +10,10 @@ When the user requests a clean KrbRelayUp/ESC8 rerun, first purge the Kerberos c
 
 If a SYSTEM-owned proof file cannot be deleted by antrovmp, report it and use a unique output path for the next test so stale output cannot be mistaken for fresh evidence.
 
+# Post-test packaging
+
+After the final build and authorized end-to-end test pass, create or refresh `KrbRelayBof-direct-minimal.zip` containing exactly `Makefile`, `krbrelay.cna`, `bof/beacon.h`, `bof/krbrelay.c`, `bof/krbrelay.x64.o`, and `relay/relay_server.py`. Verify the archive listing and report its SHA-256. Do not include credentials, lab-local metadata, logs, certificates, private keys, Kerberos tickets, or other proof artifacts.
+
 # Subagent model routing
 
-Use subagents while working whenever the task has an independently bounded subtask. Route orchestration and straightforward authorized cybersecurity work to `gpt-5.6-cyber` with medium reasoning and an explicit bounded context fork. Route work requiring more critical analysis to the Daybreak Red model (`gpt-5.6-cyber`) or GPT-5.6 with xhigh reasoning. Do not substitute another model if Daybreak Red is requested. Use the inherited model for routine work that does not benefit from cyber-specialized reasoning.
+Use subagents while working whenever the task has an independently bounded subtask. Route orchestration and straightforward authorized cybersecurity work to `gpt-5.6-cyber` with medium reasoning and an explicit bounded context fork. Route work requiring the most critical analysis to `gpt-daybreak-red-latest` with an explicit bounded context fork and high or stronger reasoning. Do not substitute another model when `gpt-daybreak-red-latest` is requested or unavailable. Use GPT-5.6 with xhigh reasoning for other substantial analysis, and use the inherited model for routine work that does not benefit from cyber-specialized reasoning.

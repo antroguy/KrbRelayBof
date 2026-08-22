@@ -6,8 +6,8 @@ Ludus lab:
 1. The x64 BOF registers the same COM/RPC relay used by KrbRelayUp and forces
    the selected privileged COM service to authenticate as the machine named at
    runtime.
-2. The BOF binds to one Python invocation with a 256-bit run nonce, then
-   exchanges complete DCE/RPC SPNEGO blobs using the documented `KRB1` framing.
+2. The BOF exchanges complete DCE/RPC SPNEGO blobs using the documented
+   `KRB1` framing.
 3. Python relays each leg on one TCP connection to the Kerberos-only IIS site,
    then enrolls the template named at runtime on that authenticated connection.
 4. Python verifies that the certificate public key matches its in-memory RSA
@@ -26,6 +26,9 @@ The Makefile expects a MinGW package tree at `/tmp/krb-mingw-root`:
 make
 make verify
 ```
+
+The single build artifact is `bof/krbrelay.x64.o`. It is an ordinary COFF BOF;
+the build does not produce, embed, or upload PIC, shellcode, a PE, or an EXE.
 
 With a system MinGW install, override `MINGW_PREFIX` and the Makefile compiler
 paths as appropriate.
@@ -47,32 +50,38 @@ proxychains4 /home/kali/Tools/Certipy/.venv/bin/python relay/relay_server.py \
   --trace-spnego --export-pfx-b64 --pfx-out MACHINE-machine.pfx
 ```
 
-Python generates and prints a fresh run nonce when `--run-nonce` is omitted.
-Copy the printed nonce into the matching Beacon command. To preselect it, pass
-the same 64 hexadecimal characters with `--run-nonce`.
-
 Beacon commands:
 
 ```text
 rportfwd_local RELAY_PORT 127.0.0.1 RELAY_PORT
-krbrelay SACRIFICIAL_PROCESS RELAY_PORT http/ADCS_HOST RPC_PORT RUN_NONCE
+krbrelay RELAY_PORT http/ADCS_HOST RPC_PORT
 ```
 
-The reverse forward binds the relay port on target loopback. The BOF starts the
-caller-selected image suspended, injects one self-resolving 17 KB raw-PIC
-relay core and its parameter block with direct Win32 calls, runs the original
-KrbRelayUp COM path in that clean process, collects diagnostics, and terminates
-the image. There is no target file, PE/DLL mapping, sRDI layer, nested COFF
-loader, Cobalt spawn/inject API, OXID service, or target TCP-135 callback.
+The reverse forward binds the relay port on target loopback. Cobalt loads the
+one COFF object and calls `go`; its worker thread, COM/RPC endpoint, SSPI hook,
+bridge socket, and cleanup all remain inside the invoking Beacon process. The
+worker unregisters its RPC interface, restores SSPI, waits for in-flight RPC
+callbacks, and tears down its COM apartment before Cobalt unloads the BOF. The
+BOF creates no process, remote allocation, remote thread, PIC, shellcode,
+PE/DLL mapping, or sRDI layer, and uploads no executable.
 
-The Cobalt command exposes the process command line, relay port, service SPN,
-and target-local RPC endpoint. The relay address and RPC binding address are
-fixed to loopback by the CNA, and the known-good trigger CLSID is internal.
+The Cobalt command exposes only the relay port, service SPN, and target-local
+RPC endpoint. The relay address and RPC binding address are fixed to loopback
+by the CNA, and the known-good trigger CLSID is internal.
 
-The helper constrains Negotiate to the supplied SPN and relays only Kerberos
-SPNEGO records to IIS. It exits as soon as Python confirms that IIS authenticated
-the persistent connection; Python then completes enrollment independently. A
-60-second watchdog protects only the target-side COM/authentication operation.
+Windows makes COM security immutable after initialization. At entry, the BOF
+checks whether the invoking Beacon task thread retained a COM apartment and
+balances up to eight retained references before starting its own STA. This
+allows the direct BOF to recover when that task thread was the final COM owner,
+but it intentionally clears that thread's previous COM state. If another
+Beacon thread owns the process COM state, stage 32 remains an explicit failure;
+use a fresh Beacon and run this BOF before other COM tooling. No helper process
+is created in either case.
+
+The BOF constrains Negotiate to the supplied SPN and relays only Kerberos
+SPNEGO records to IIS. It returns as soon as Python confirms that IIS
+authenticated the persistent connection; Python then completes enrollment
+independently.
 
 The Python functions `run_session()` and `enroll()` also return a
 `CertificateBundle` for an in-process follow-on consumer. Without

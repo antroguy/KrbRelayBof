@@ -1,5 +1,4 @@
-/* Minimal Cobalt Strike BOF ABI used by the launcher. The injected PIC core
-   replaces these declarations with the self-contained pic_compat.h ABI. */
+/* Minimal Cobalt Strike BOF ABI used by the direct relay object. */
 typedef struct {
     char *original;
     char *buffer;
@@ -14,6 +13,3 @@ DECLSPEC_IMPORT void BeaconDataParse(datap *parser, char *buffer, int size);
 DECLSPEC_IMPORT char *BeaconDataExtract(datap *parser, int *size);
 DECLSPEC_IMPORT int BeaconDataInt(datap *parser);
 DECLSPEC_IMPORT void BeaconPrintf(int type, char *fmt, ...);
-DECLSPEC_IMPORT BOOL BeaconSpawnTemporaryProcess(BOOL x86, BOOL ignoreToken, STARTUPINFO *si, PROCESS_INFORMATION *pi);
-DECLSPEC_IMPORT void BeaconInjectTemporaryProcess(PROCESS_INFORMATION *pi, char *payload, int payload_len, int payload_offset, char *arg, int arg_len);
-DECLSPEC_IMPORT void BeaconCleanupProcess(PROCESS_INFORMATION *pi);

