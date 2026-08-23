@@ -310,6 +310,14 @@ Before the BOF returns, cleanup restores the original byte and removes the VEH.
 The only SSPI address that immutable COM can retain belongs to `secur32.dll`,
 not the unloaded COFF. A later task can install its own breakpoint and hook.
 
+The redirected SSPI calls run on RPC runtime pool threads, not on the Beacon
+task thread. Those threads can remain pooled for several minutes. The hook
+therefore records progress only in BOF state and does not call `BeaconPrintf`;
+the disposable BOF worker publishes the accumulated messages after activation
+returns. Calling a loader-backed Beacon API from the RPC thread can leave its
+fiber-local cleanup callback pointing into an unloaded BOF mapping when that
+thread eventually exits.
+
 ## Vectored exception handling
 
 The VEH is filtered rather than being a process-wide catch-all:

