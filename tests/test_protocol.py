@@ -104,7 +104,7 @@ class ProtocolTests(unittest.TestCase):
         ) as enroll_mock:
             self.assertIs(run_session(channel, options), bundle)
         self.assertEqual(channel.sent, [(MSG_AUTH_OK, b"")])
-        self.assertTrue(channel.terminal)
+        self.assertTrue(channel.bof_released)
         enroll_mock.assert_called_once()
 
 

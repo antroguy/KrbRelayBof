@@ -5,7 +5,9 @@ SYSROOT := $(MINGW_PREFIX)
 GCCLIB := $(MINGW_PREFIX)/usr/lib/gcc/x86_64-w64-mingw32/15-posix/
 BINPREFIX := $(MINGW_PREFIX)/usr/x86_64-w64-mingw32/bin/
 INCLUDE := $(MINGW_PREFIX)/usr/x86_64-w64-mingw32/include
-CFLAGS := --sysroot=$(SYSROOT) -B$(GCCLIB) -B$(BINPREFIX) -Os -fno-stack-protector -fno-builtin -fno-asynchronous-unwind-tables -mno-stack-arg-probe -I$(INCLUDE)
+CFLAGS := --sysroot=$(SYSROOT) -B$(GCCLIB) -B$(BINPREFIX) -Os \
+	-fno-stack-protector -fno-builtin -fno-asynchronous-unwind-tables \
+	-mno-stack-arg-probe -I$(INCLUDE)
 
 .PHONY: all verify clean
 

