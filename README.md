@@ -1,14 +1,15 @@
 # KrbRelay BOF
 
-KrbRelay BOF is a reusable, certificate-only implementation of COM coercion
-and Kerberos relay for Cobalt Strike. A single x64 BOF causes a privileged
-Windows COM server to authenticate to a task-owned RPC resolver, relays that
-machine authentication to AD CS Web Enrollment, and returns without spawning
-or injecting into another process.
+KrbRelay BOF is a reusable implementation of COM coercion and Kerberos relay
+for Cobalt Strike. A single x64 BOF causes a privileged Windows COM server to
+authenticate to a task-owned RPC resolver and transports that authentication
+to Python for one of three target actions: AD CS Web Enrollment, an LDAP
+Shadow Credential write, or an LDAP RBCD write. It never spawns or injects
+into another process.
 
-The project deliberately ends at a verified machine certificate and private
-key. It does not perform PKINIT, request an S4U ticket, import a ticket into the
-Beacon, install a service, or extract credentials.
+The project returns a verified certificate/private key or a confirmed LDAP
+attribute update. It does not perform PKINIT, request an S4U ticket, import a
+ticket into the Beacon, install a service, or extract credentials.
 
 ## Contents
 
@@ -40,15 +41,15 @@ object:
 - No BOF code pointer is left in COM/RPCSS after the COFF is unloaded.
 - The operator-facing CNA keeps the loopback addresses and static coercion
   CLSID internal.
-- Cryptographic and HTTP work is isolated in Python, where the authenticated
-  IIS connection can remain alive after the BOF returns.
+- Cryptographic, HTTP, and LDAP work is isolated in Python, where the target
+  connection can remain alive until its operation is verified.
 
 The two artifacts required at runtime are:
 
 | Artifact | Role |
 | --- | --- |
 | `bof/krbrelay.x64.o` | Creates the COM/RPC exchange and relays opaque authentication tokens. |
-| `relay/relay_server.py` | Relays those tokens to IIS and completes Web Enrollment. |
+| `relay/relay_server.py` | Relays to IIS or LDAP and performs the selected target action. |
 
 `krbrelay.cna` is optional when the object is submitted directly through a C2
 API. `Makefile`, `bof/krbrelay.c`, and `bof/beacon.h` are needed to rebuild it.
@@ -75,12 +76,12 @@ flowchart LR
         P["relay_server.py\n127.0.0.1:RELAY_PORT"]
     end
 
-    subgraph A[AD CS]
-        I["IIS /certsrv/\nhttp/ADCS_HOST"]
+    subgraph A[Relay target]
+        I["IIS /certsrv/\nor DC LDAP"]
     end
 
     F -->|"reverse-forwarded KRB1 TCP"| P
-    P <-->|"persistent HTTP Negotiate + enrollment"| I
+    P <-->|"persistent HTTP or LDAP SASL exchange"| I
 ```
 
 The RPC endpoint and bridge port serve different purposes:
@@ -90,8 +91,9 @@ The RPC endpoint and bridge port serve different purposes:
 - `RELAY_PORT` is a reverse-forwarded loopback port. It carries KRB1 records
   from the BOF to Python running on the Cobalt client.
 
-The proxy is used only for Python's outbound connection to AD CS. It does not
-replace `rportfwd_local` and does not carry the target-local COM/RPC exchange.
+The proxy is used only for Python's outbound connection to IIS or the DC. It
+does not replace `rportfwd_local` and does not carry the target-local COM/RPC
+exchange.
 
 ## Technical walkthrough
 
@@ -279,6 +281,29 @@ selected certificate template, retrieves the issued certificate, and verifies:
 The private key remains only in Python memory unless `--pfx-out` or
 `--export-pfx-b64` is selected.
 
+### 13. Direct LDAP writes share the final bind window
+
+In `shadowcred` and `rbcd` modes Python sends the source AP-REQ in an LDAP
+`GSS-SPNEGO` SASL BindRequest and returns the DC's AP-REP through KRB1. The
+second source token finishes that same persistent LDAP bind.
+
+RPC requests packet-integrity Kerberos, so a normal LDAP client would sign
+messages sent after the bind. Python never receives the Kerberos session key
+and therefore cannot produce those signatures. Instead it encodes the one
+selected ModifyRequest before coercion, places that complete request ahead of
+the final BindRequest in one TCP write, and reads responses by LDAP message ID.
+AD dispatches already-read operations on separate workers: the bind commits
+before the queued write's authorization check while no unsigned message is
+sent after packet integrity becomes active. Python sends KRB1 `AUTH_OK` only
+after both the final BindResponse and the ModifyResponse are successful.
+
+Shadow mode builds one 2048-bit BCRYPT RSA public-key blob, hashes it for the
+KeyCredential identifier, adds the `NGC`/`AD` fields required by the computer
+SELF validated write, and puts the matching private key and certificate in a
+passwordless PFX. RBCD mode replaces the exact computer DN's descriptor with
+an owner and access DACL for only `--delegate-sid`. Its identical trustee ACEs
+preserve the same effective grant while making worker scheduling reliable.
+
 ## Why the BOF is reusable
 
 The original in-process approach replaced the SSPI function-table entry with
@@ -351,8 +376,8 @@ Message types:
 | Value | Direction | Meaning |
 | ---: | --- | --- |
 | 3 | BOF → Python | Complete RPC client authentication value |
-| 4 | Python → BOF | IIS continuation to publish into RPCSS |
-| 5 | Python → BOF | IIS returned HTTP 200; release the BOF |
+| 4 | Python → BOF | Target continuation to publish into RPCSS |
+| 5 | Python → BOF | Target operation succeeded; release the BOF |
 | 6 | Either | Bounded non-sensitive error text |
 
 The BOF and Python validate the allowed type and length at each state. Token
@@ -360,7 +385,7 @@ records are limited to 65,535 bytes and errors to 512 bytes.
 
 ## Network topology
 
-A two-Beacon topology is useful when the AD CS route exists only through a
+A two-Beacon topology is useful when the AD CS/DC route exists only through a
 Cobalt SOCKS pivot:
 
 | Role | Required state |
@@ -369,8 +394,9 @@ Cobalt SOCKS pivot:
 | KrbRelay Beacon | Runs only the BOF; normally keep sleep at `5`. |
 | Python relay | Runs on the same client that owns `rportfwd_local`. |
 
-Python's AD CS connection is the only connection run through proxychains. The
-listener remains local:
+Python's outbound target connection is the only connection run through the
+SOCKS pivot. The KRB1 listener remains local. HTTP can use proxychains; LDAP
+also has explicit SOCKS options so the listener itself is not proxied:
 
 ```sh
 proxychains4 -q -f /path/to/proxychains.conf \
@@ -384,6 +410,15 @@ proxychains4 -q -f /path/to/proxychains.conf \
   --machine MACHINE_NAME \
   --template Machine \
   --pfx-out 'MACHINE_NAME-{request_id}.pfx'
+
+/path/to/python relay/relay_server.py \
+  --port RELAY_PORT --allow 127.0.0.1 \
+  --mode shadowcred \
+  --ldap-host DC_HOST --ldap-address DC_ADDRESS \
+  --ldap-socks-address 127.0.0.1 --ldap-socks-port SOCKS_PORT \
+  --domain DOMAIN --machine MACHINE_NAME \
+  --ldap-target-dn 'CN=MACHINE_NAME,OU=Workstations,DC=example,DC=test' \
+  --pfx-out 'shadow-{request_id}.pfx'
 ```
 
 `rportfwd_local` belongs to the lifetime of the Cobalt client that created it.
@@ -415,11 +450,12 @@ Beacon:
 rportfwd_local RELAY_PORT 127.0.0.1 RELAY_PORT
 ```
 
-After Python prints its matching-command line, execute on the separate x64
-KrbRelay Beacon:
+After Python prints its matching-command line, execute that exact service SPN
+on the separate x64 KrbRelay Beacon:
 
 ```text
 krbrelay RELAY_PORT http/ADCS_HOST RPC_PORT
+krbrelay RELAY_PORT ldap/DC_HOST RPC_PORT
 ```
 
 Example topology with placeholders:
@@ -429,9 +465,11 @@ Proxy Beacon:    rportfwd_local 9597 127.0.0.1 9597
 KrbRelay Beacon: krbrelay 9597 http/ca.example.test 65260
 ```
 
-Every invocation does one activation. To obtain another fresh certificate,
-leave Python running with `--count 2` and submit the same command again as a
-separate Beacon task.
+Every invocation does one activation. For another action against the same
+service SPN, leave Python running with `--count 2` and submit the command again
+as a separate Beacon task. A process that has completed its first KrbRelay
+activation can cache that service principal; use another non-proxy Beacon when
+changing between `http/...` and `ldap/...`.
 
 ### Relay options
 
@@ -439,6 +477,7 @@ separate Beacon task.
 --listen ADDRESS       KRB1 listener address; defaults to loopback
 --port PORT            KRB1 listener / target reverse-forward port
 --allow ADDRESS        only accepted KRB1 peer address
+--mode MODE            adcs, shadowcred, or rbcd
 --adcs-host HOST       HTTP Host and service-SPN hostname
 --adcs-address ADDRESS destination used for the actual TCP connection
 --adcs-port PORT        defaults to 80
@@ -449,6 +488,14 @@ separate Beacon task.
 --pfx-out PATH         passwordless PKCS#12 output; supports {request_id}
 --export-pfx-b64       additionally print the PKCS#12 as base64
 --trace-spnego         print complete authentication-token material
+--ldap-host HOST       hostname used by the ldap service SPN
+--ldap-address ADDRESS DC address reached by Python
+--ldap-port PORT        defaults to 389, or 636 with --ldap-tls
+--ldap-socks-port PORT  use an explicit local SOCKS5 route to the DC
+--ldap-target NAME     account to update; defaults to MACHINE$
+--ldap-target-dn DN    exact account DN; required for an OU or RBCD
+--delegate-account     operator label for the RBCD trustee
+--delegate-sid SID     password-known SPN account SID trusted for RBCD
 ```
 
 `--trace-spnego` and `--export-pfx-b64` produce sensitive material. Without
@@ -459,10 +506,11 @@ them, normal output contains only protocol metadata, status, and CA request ID.
 A complete BOF-side success includes:
 
 ```text
-[*] Triggering COM machine authentication
+[*] Triggering COM object: McpManagementService
 [*] Relayed authentication leg 1
 [*] Relayed authentication leg 2
-[+] IIS authenticated the relayed machine account
+[+] Relay target authenticated the machine account
+[+] Cleanup complete: resolver removed, SSPI restored, VEH removed
 ```
 
 Python must independently report:
@@ -475,8 +523,11 @@ Python must independently report:
 [+] Machine certificate acquired and key pair verified
 ```
 
-BOF completion occurs before enrollment finishes, so neither output stream is
-sufficient by itself.
+For LDAP modes, Python validates the queued ModifyResponse before it releases
+the BOF. Shadow success also requires the saved PFX to complete PKINIT; RBCD
+can be consumed through S4U2Self/S4U2Proxy with the controlled trustee. For AD
+CS, BOF completion occurs before enrollment finishes, so neither output stream
+is sufficient by itself.
 
 The numeric failure stage identifies the failing subsystem:
 
@@ -517,12 +568,20 @@ allows the next independent invocation to reuse the process safely.
   different CLSID string.
 - An already-immutable process must advertise Negotiate or Kerberos through
   `CoQueryAuthenticationServices`.
-- The relay implements HTTP/1.1 Web Enrollment, not HTTPS termination.
+- AD CS mode implements HTTP/1.1 Web Enrollment, not HTTPS termination.
+- Direct LDAP uses a queued final-bind/write exchange because RPC requests
+  packet integrity and Python deliberately does not obtain the Kerberos key.
+- RBCD replaces the attribute with an allow DACL for the supplied SID. The SID
+  should belong to a password-known computer or service account with an SPN.
+- A computer can add an NGC Shadow Credential only when no NGC value already
+  exists. Remove the value you control before requesting another one.
+- Repeat a service SPN in one Beacon; changing the SPN may reuse the process's
+  previously cached COM exporter security binding.
 - The service SPN hostname, IIS Host header, and environment's Kerberos service
   identity must agree.
 - The machine account needs permission to enroll the selected template.
 - The client owning `rportfwd_local` must remain connected through the BOF
-  exchange, and a proxy used for AD CS must remain healthy through retrieval.
+  exchange, and the target proxy must remain healthy through the operation.
 
 ## References
 
