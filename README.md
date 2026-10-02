@@ -1,4 +1,5 @@
 # KrbRelay BOF
+NOTE: This has only been tested on Cobalt Strike. The BOF spawns a new thread, so not all C2s play nice with that (i.e., might crash it)
 
 A single-process Beacon Object File implementation of COM coercion and Kerberos relay. The BOF forwards machine-account authentication to a Python relay server for:
 
